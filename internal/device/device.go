@@ -23,6 +23,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/ButterFuture/GoQuark/internal/config"
+	"github.com/ButterFuture/GoQuark/internal/demobuild"
 )
 
 // Crockford base32 alphabet (OpenUTDID-style machine id).
@@ -75,7 +76,11 @@ var osVersions = []string{
 
 // EnsureDevice fills config.Device if missing, or repairs a bad device_name.
 // nameOverride forces a custom device name (still truncated like official).
+// Demo builds always use a host-stable fake identity (never product device).
 func EnsureDevice(cfg *config.Config, nameOverride string) error {
+	if demobuild.Enabled {
+		return ensureDemoDevice(cfg, nameOverride)
+	}
 	if cfg.HasDevice() {
 		changed := false
 		if nameOverride != "" && nameOverride != cfg.Device.DeviceName {

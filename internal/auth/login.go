@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/ButterFuture/GoQuark/internal/config"
+	"github.com/ButterFuture/GoQuark/internal/demobuild"
 	"github.com/ButterFuture/GoQuark/internal/device"
 	"github.com/skip2/go-qrcode"
 )
@@ -68,7 +69,11 @@ func defaultOpts(o *Options) {
 }
 
 // LoginQR runs official PC QR login flow and persists session into cfg.
+// Demo builds (-tags demo / goquarkdemo) use a full mock path (fake QR, auto success).
 func LoginQR(cfg *config.Config, opt Options) (*LoginResult, error) {
+	if demobuild.Enabled {
+		return loginQRDemo(cfg, opt)
+	}
 	defaultOpts(&opt)
 	if err := device.EnsureDevice(cfg, ""); err != nil {
 		return nil, err

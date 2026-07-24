@@ -50,6 +50,10 @@ GoQuark is a **Go** client for Quark cloud drive, aimed at terminals and automat
 - MCP tools: device, user, list, download  
 - Version injected at build time (see [Versioning](#versioning))
 
+<p align="center">
+  <img src="docs/screenshot-tui.png" alt="GoQuark TUI" width="820">
+</p>
+
 > ⭐ If this project helps you, a **Star** would be greatly appreciated!
 
 ---
@@ -91,7 +95,7 @@ curl -fsSL https://raw.githubusercontent.com/ButterFuture/GoQuark/main/scripts/i
 Default path: `~/.local/bin/goquark` (or `/usr/local/bin` if writable). Options:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/ButterFuture/GoQuark/main/scripts/install.sh | bash -s -- --version v1.0.0
+curl -fsSL https://raw.githubusercontent.com/ButterFuture/GoQuark/main/scripts/install.sh | bash -s -- --version v1.0.1
 curl -fsSL https://raw.githubusercontent.com/ButterFuture/GoQuark/main/scripts/install.sh | bash -s -- --dir ~/.local/bin
 ```
 
@@ -103,8 +107,8 @@ curl -fsSL https://raw.githubusercontent.com/ButterFuture/GoQuark/main/scripts/i
 4. `chmod +x` and place it on your `PATH` as `goquark`
 
 ```bash
-chmod +x goquark_1.0.0_linux_amd64
-sudo mv goquark_1.0.0_linux_amd64 /usr/local/bin/goquark
+chmod +x goquark_1.0.1_linux_amd64
+sudo mv goquark_1.0.1_linux_amd64 /usr/local/bin/goquark
 ```
 
 After install, **start with the TUI**:
@@ -224,7 +228,7 @@ stdio server: host runs `goquark mcp`.
 
 | Item | Detail |
 |------|--------|
-| Source of truth | Root [`VERSION`](VERSION) (currently **1.0.0**) |
+| Source of truth | Root [`VERSION`](VERSION) (currently **1.0.1**) |
 | Build inject | `scripts/build.sh` / CI via `-ldflags` |
 | Local `go run` | Shows `dev` if not injected |
 
@@ -234,7 +238,7 @@ stdio server: host runs `goquark mcp`.
 goquark version
 ```
 
-Release flow: ship features → bump `VERSION` → tag `v1.0.0` → CI / Release.
+Release flow: ship features → bump `VERSION` → tag `v1.0.1` → CI / Release.
 
 ---
 
@@ -309,7 +313,7 @@ Include: identity & contact, paths/commits, rights basis, requested action.
 
 ## Status
 
-**v1.0.0** — Login, browse, TUI download center, multi-file download (pause/resume), MCP.
+**v1.0.1** — Login, browse, TUI download center, multi-file download (pause/resume), MCP, self-update and docs polish.
 
 Planned: public release channel, optional in-app update check, broader MCP tools.
 

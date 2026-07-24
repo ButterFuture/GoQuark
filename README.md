@@ -50,6 +50,10 @@ GoQuark 是用 **Go** 写的夸克网盘客户端，面向命令行与自动化�
 - MCP 工具：设备、用户、列目录、下载  
 - 版本号由构建注入（见 [版本](#版本)）
 
+<p align="center">
+  <img src="docs/screenshot-tui.png" alt="GoQuark TUI" width="820">
+</p>
+
 > ⭐ 如果这个项目对你有帮助，欢迎点个 **Star** 支持一下！
 
 ---
@@ -92,7 +96,7 @@ curl -fsSL https://raw.githubusercontent.com/ButterFuture/GoQuark/main/scripts/i
 
 ```bash
 # 指定版本 / 目录
-curl -fsSL https://raw.githubusercontent.com/ButterFuture/GoQuark/main/scripts/install.sh | bash -s -- --version v1.0.0
+curl -fsSL https://raw.githubusercontent.com/ButterFuture/GoQuark/main/scripts/install.sh | bash -s -- --version v1.0.1
 curl -fsSL https://raw.githubusercontent.com/ButterFuture/GoQuark/main/scripts/install.sh | bash -s -- --dir ~/.local/bin
 ```
 
@@ -108,8 +112,8 @@ curl -fsSL https://raw.githubusercontent.com/ButterFuture/GoQuark/main/scripts/i
 4. `chmod +x goquark_*` 后移到 `PATH` 中，并重命名为 `goquark`
 
 ```bash
-chmod +x goquark_1.0.0_linux_amd64
-sudo mv goquark_1.0.0_linux_amd64 /usr/local/bin/goquark
+chmod +x goquark_1.0.1_linux_amd64
+sudo mv goquark_1.0.1_linux_amd64 /usr/local/bin/goquark
 ```
 
 安装完成后，**推荐直接启动 TUI**：
@@ -229,7 +233,7 @@ goquark version
 
 | 项目 | 说明 |
 |------|------|
-| 唯一来源 | 仓库根目录 [`VERSION`](VERSION)（当前 **1.0.0**） |
+| 唯一来源 | 仓库根目录 [`VERSION`](VERSION)（当前 **1.0.1**） |
 | 构建注入 | `scripts/build.sh` / CI 通过 `-ldflags` 写入二进制 |
 | 本地 `go run` | 未注入时显示 `dev` |
 
@@ -239,7 +243,7 @@ goquark version
 goquark version        # 查看已注入版本
 ```
 
-发版建议：改功能 → 确认 → 更新 `VERSION` → 打 tag `v1.0.0` → CI / Release。
+发版建议：改功能 → 确认 → 更新 `VERSION` → 打 tag `v1.0.1` → CI / Release。
 
 ---
 
@@ -314,7 +318,7 @@ Copyright (c) 2026 ButterFuture
 
 ## 状态
 
-**v1.0.0** — 登录、浏览、TUI 下载中心、多文件下载（暂停/继续）、MCP 可用。
+**v1.0.1** — 登录、浏览、TUI 下载中心、多文件下载（暂停/继续）、MCP、自更新与文档完善。
 
 后续计划：公开仓正式发版通道、应用内检查更新（可选）、更丰富的 MCP 能力。
 

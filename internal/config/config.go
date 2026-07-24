@@ -8,6 +8,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/ButterFuture/GoQuark/internal/demobuild"
 )
 
 // Device holds persistent device profile. Generated once, never regenerated.
@@ -54,6 +56,10 @@ func DefaultPath() string {
 		return p
 	}
 	home, _ := os.UserHomeDir()
+	// Demo builds use a separate config dir so product sessions/devices never mix.
+	if demobuild.Enabled {
+		return filepath.Join(home, ".config", "goquark-demo", "config.json")
+	}
 	return filepath.Join(home, ".config", "goquark", "config.json")
 }
 
@@ -64,20 +70,32 @@ func DefaultDownloadDir() string {
 	}
 	home, err := os.UserHomeDir()
 	if err != nil || home == "" {
+		if demobuild.Enabled {
+			return filepath.Join(".", "GoQuark-Demo")
+		}
 		return filepath.Join(".", "GoQuark")
 	}
 	// Linux XDG user-dirs may override Downloads
 	if xdg := os.Getenv("XDG_DOWNLOAD_DIR"); xdg != "" {
+		if demobuild.Enabled {
+			return filepath.Join(xdg, "GoQuark-Demo")
+		}
 		return filepath.Join(xdg, "GoQuark")
 	}
 	// Common layouts
 	for _, name := range []string{"Downloads", "downloads", "Download"} {
 		p := filepath.Join(home, name)
 		if st, err := os.Stat(p); err == nil && st.IsDir() {
+			if demobuild.Enabled {
+				return filepath.Join(p, "GoQuark-Demo")
+			}
 			return filepath.Join(p, "GoQuark")
 		}
 	}
 	// Fallback even if Downloads doesn't exist yet
+	if demobuild.Enabled {
+		return filepath.Join(home, "Downloads", "GoQuark-Demo")
+	}
 	return filepath.Join(home, "Downloads", "GoQuark")
 }
 

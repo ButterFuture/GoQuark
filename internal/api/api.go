@@ -22,6 +22,10 @@ type FileEntry struct {
 
 // UserInfo merges pan account + member capacity when available.
 func UserInfo(c *client.Client) (map[string]any, error) {
+	if DemoMode {
+		_ = c
+		return demoUserInfo(), nil
+	}
 	// Prefer official desktop userinfo (used by PC client).
 	acc, err := c.DoJSON("GET", client.PanDomain+"/desktop/account/userinfo", nil, nil)
 	if err != nil {
@@ -64,6 +68,13 @@ func UserInfo(c *client.Client) (map[string]any, error) {
 
 // ListDir lists a directory. pdirFID empty/"0" means root.
 func ListDir(c *client.Client, pdirFID string, page, size int) ([]FileEntry, error) {
+	if DemoMode {
+		// Screenshot / demo build only (-tags demo). No network list.
+		_ = c
+		_ = page
+		_ = size
+		return mockListDir(pdirFID), nil
+	}
 	if pdirFID == "" {
 		pdirFID = "0"
 	}
@@ -148,6 +159,11 @@ func ResolvePath(c *client.Client, path string) (fid string, isDir bool, err err
 
 // GetDownloadURL requests CDN url for fid (PC download API).
 func GetDownloadURL(c *client.Client, fid string) (downloadURL string, size int64, err error) {
+	if DemoMode {
+		_ = c
+		_ = fid
+		return "", 0, fmt.Errorf("demo mode: download is disabled (screenshot build)")
+	}
 	body := map[string]any{"fids": []string{fid}}
 	resp, err := c.DoJSON("POST", client.DriveDomain+"/1/clouddrive/file/download", nil, body)
 	if err != nil {
