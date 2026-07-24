@@ -47,7 +47,7 @@ GoQuark 是用 **Go** 写的夸克网盘客户端，面向命令行与自动化�
 - 暂停 / 继续 / 取消；退出时安全收尾  
 - 目录浏览、用户信息（`ls` / `whoami`）  
 - 终端 UI（支持鼠标）  
-- MCP 工具：设备、用户、列目录、下载  
+- MCP 工具：状态、设备、用户、列目录、下载队列、更新  
 - 版本号由构建注入（见 [版本](#版本)）
 
 <p align="center">
@@ -222,10 +222,23 @@ goquark version
 
 | Tool | 说明 |
 |------|------|
-| `goquark_device` | 设备信息 |
-| `goquark_whoami` | 当前用户 |
-| `goquark_ls` | 列目录（`path`，默认 `/`） |
-| `goquark_download` | 下载（`remote`、`local`） |
+| `goquark_status` | 登录态 / 配置 / 版本 / 下载目录（不调网盘 API） |
+| `goquark_device` | 本地设备信息 |
+| `goquark_whoami` | 当前用户 + 版本/更新状态 |
+| `goquark_ls` | 列目录（`path`，可选 `page`/`size`） |
+| `goquark_stat` | 解析路径或 fid → 元数据 |
+| `goquark_download` | 下载文件（`remote`，可选 `local`/`wait`） |
+| `goquark_downloads` | 下载任务列表（可选 `active_only`） |
+| `goquark_download_control` | 任务控制：`pause`/`resume`/`cancel`/`clear_done` |
+| `goquark_check_update` | 检查 GitHub Release（不下载） |
+| `goquark_update` | 检查或应用自更新（`apply=true` 才真正更新） |
+
+**Agent 提示**
+
+1. 先 `goquark_status` 看是否已登录；未登录时请用户在本机执行 `goquark login`（MCP 不发起扫码）。  
+2. 浏览：`goquark_ls` → `goquark_stat` → `goquark_download`。  
+3. 大文件可用 `goquark_download` 且 `wait=false`，再 `goquark_downloads` 轮询。  
+4. 更新默认只检查；真正升级需 `goquark_update` 且 `apply=true`。
 
 ---
 

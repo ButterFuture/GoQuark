@@ -47,7 +47,7 @@ GoQuark is a **Go** client for Quark cloud drive, aimed at terminals and automat
 - Pause / resume / cancel; safe shutdown on quit  
 - Browse & account info (`ls` / `whoami`)  
 - Terminal UI (mouse-friendly)  
-- MCP tools: device, user, list, download  
+- MCP tools: status, device, user, list, download queue, update  
 - Version injected at build time (see [Versioning](#versioning))
 
 <p align="center">
@@ -217,6 +217,17 @@ stdio server: host runs `goquark mcp`.
 
 | Tool | Description |
 |------|-------------|
+| `goquark_status` | Login/config/version/download_dir (no cloud API) |
+| `goquark_device` | Local device profile |
+| `goquark_whoami` | Account info + version/update status |
+| `goquark_ls` | List directory (`path`, optional `page`/`size`) |
+| `goquark_stat` | Resolve path or fid → metadata |
+| `goquark_download` | Download file (`remote`, optional `local`/`wait`) |
+| `goquark_downloads` | Download task list (optional `active_only`) |
+| `goquark_download_control` | Control tasks: `pause`/`resume`/`cancel`/`clear_done` |
+| `goquark_check_update` | Check GitHub Release (no download) |
+| `goquark_update` | Check or apply self-update (`apply=true` to install) |
+|
 | `goquark_device` | Device profile |
 | `goquark_whoami` | Logged-in user |
 | `goquark_ls` | List path (`path`, default `/`) |
