@@ -11,6 +11,20 @@ Versioning follows the root [`VERSION`](../VERSION) file (semver).
 
 ### Changed
 
+## [1.0.2] — 2026-07-25
+
+### Added
+- MCP QR login for agents: `goquark_login` / `goquark_login_poll` with labeled `qr_url` / `qr_content` / `qr_ascii`
+- MCP tools: `goquark_status`, `goquark_stat`, download queue list/control, structured `goquark_ls`
+- TUI screenshot in README; social preview asset for Open Graph
+
+### Changed
+- MCP download supports default download dir and `wait=false` enqueue
+- README MCP section: collapsed tool list (`更多：MCP工具一览`); hosts auto-discover tools
+
+### Fixed
+- MCP config reload no longer copies `sync.Mutex` (go vet / CI)
+
 ## [1.0.1] — 2026-07-24
 
 ### Added

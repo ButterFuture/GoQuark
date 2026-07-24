@@ -15,7 +15,7 @@
 </p>
 
 <p align="center">
-  <img alt="version" src="https://img.shields.io/badge/version-1.0.1-blue">
+  <img alt="version" src="https://img.shields.io/badge/version-1.0.2-blue">
   <img alt="go" src="https://img.shields.io/badge/Go-1.22+-00ADD8?logo=go">
   <img alt="license" src="https://img.shields.io/badge/license-AGPL--3.0-blue">
   <img alt="platform" src="https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-lightgrey">
@@ -95,7 +95,7 @@ curl -fsSL https://raw.githubusercontent.com/ButterFuture/GoQuark/main/scripts/i
 Default path: `~/.local/bin/goquark` (or `/usr/local/bin` if writable). Options:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/ButterFuture/GoQuark/main/scripts/install.sh | bash -s -- --version v1.0.1
+curl -fsSL https://raw.githubusercontent.com/ButterFuture/GoQuark/main/scripts/install.sh | bash -s -- --version v1.0.2
 curl -fsSL https://raw.githubusercontent.com/ButterFuture/GoQuark/main/scripts/install.sh | bash -s -- --dir ~/.local/bin
 ```
 
@@ -107,8 +107,8 @@ curl -fsSL https://raw.githubusercontent.com/ButterFuture/GoQuark/main/scripts/i
 4. `chmod +x` and place it on your `PATH` as `goquark`
 
 ```bash
-chmod +x goquark_1.0.1_linux_amd64
-sudo mv goquark_1.0.1_linux_amd64 /usr/local/bin/goquark
+chmod +x goquark_1.0.2_linux_amd64
+sudo mv goquark_1.0.2_linux_amd64 /usr/local/bin/goquark
 ```
 
 After install, **start with the TUI**:
@@ -241,7 +241,7 @@ stdio server: host runs `goquark mcp` (**absolute path** required).
 
 | Item | Detail |
 |------|--------|
-| Source of truth | Root [`VERSION`](VERSION) (currently **1.0.1**) |
+| Source of truth | Root [`VERSION`](VERSION) (currently **1.0.2**) |
 | Build inject | `scripts/build.sh` / CI via `-ldflags` |
 | Local `go run` | Shows `dev` if not injected |
 
@@ -251,7 +251,7 @@ stdio server: host runs `goquark mcp` (**absolute path** required).
 goquark version
 ```
 
-Release flow: ship features → bump `VERSION` → tag `v1.0.1` → CI / Release.
+Release flow: ship features → bump `VERSION` → tag `v1.0.2` → CI / Release.
 
 ---
 
@@ -326,7 +326,7 @@ Include: identity & contact, paths/commits, rights basis, requested action.
 
 ## Status
 
-**v1.0.1** — Login, browse, TUI download center, multi-file download (pause/resume), MCP, self-update and docs polish.
+**v1.0.2** — MCP QR login and queue tools, docs and CI fixes; on top of v1.0.1.
 
 Planned: public release channel, optional in-app update check, broader MCP tools.
 
