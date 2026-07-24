@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/ButterFuture/GoQuark/internal/api"
+	"github.com/ButterFuture/GoQuark/internal/auth"
 	"github.com/ButterFuture/GoQuark/internal/client"
 	"github.com/ButterFuture/GoQuark/internal/config"
 	"github.com/ButterFuture/GoQuark/internal/device"
@@ -38,6 +39,9 @@ func Run(version string) error {
 	mgr.SetDestDir(cfg.EffectiveDownloadDir())
 	_, _ = mgr.LoadPersisted()
 
+	// MCP login session (in-process; one active QR at a time)
+	var loginSess *auth.QRSession
+
 	s := server.NewMCPServer("goquark", version)
 
 	// ---- status / identity (agent-friendly) ----
@@ -60,6 +64,146 @@ func Run(version string) error {
 				"login_way":    cfg.Session.LoginWay,
 				"logged_in_at": cfg.Session.LoggedInAt,
 			},
+			"login_session_active": loginSess != nil && loginSess.Token != "",
+		}
+		return textJSON(out)
+	})
+
+	// ---- login (QR for agents) ----
+
+	s.AddTool(mcp.NewTool("goquark_login",
+		mcp.WithDescription("Start Quark QR login for agents. Returns CLEARLY LABELED qr_url (open/scan link) and qr_ascii (terminal QR art). Does NOT wait for scan — call goquark_login_poll after showing QR to the user. If already logged in and force=false, returns logged_in without new QR."),
+		mcp.WithBoolean("force", mcp.Description("If true, start a new QR even when already logged in. Default false."), mcp.DefaultBool(false)),
+		mcp.WithBoolean("include_ascii", mcp.Description("Include qr_ascii terminal art (default true). Set false if only the link is needed."), mcp.DefaultBool(true)),
+	), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		force := argBool(req, "force", false)
+		includeASCII := argBool(req, "include_ascii", true)
+
+		if cfg.HasSessionCookie() && !force {
+			return textJSON(map[string]any{
+				"ok":         true,
+				"phase":      "already_logged_in",
+				"logged_in":  true,
+				"message":    "session already present; set force=true to re-login",
+				"how_to_use": "User is logged in. No QR needed.",
+			})
+		}
+
+		// Reload cfg path in case of concurrent CLI login (do not copy Config: contains Mutex)
+		if reloaded, err := config.Load(cfg.Path()); err == nil {
+			cfg = reloaded
+			_ = device.EnsureDevice(cfg, "")
+			c = client.New(cfg)
+			mgr.BindClient(c)
+		}
+
+		dir := filepath.Dir(cfg.Path())
+		_ = os.MkdirAll(dir, 0o700)
+		pngPath := filepath.Join(dir, "mcp-qrcode.png")
+		urlPath := filepath.Join(dir, "mcp-qrcode.url.txt")
+
+		sess, err := auth.StartQRLogin(cfg, auth.Options{
+			QRPngPath:  pngPath,
+			QRURLPath:  urlPath,
+			Timeout:    3 * time.Minute,
+			PrintASCII: false,
+			Quiet:      true,
+		})
+		if err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
+		loginSess = sess
+
+		out := map[string]any{
+			// Explicit labels for agents — do not confuse these fields
+			"ok":    true,
+			"phase": "qr_ready",
+			"logged_in": false,
+			"message": "Show qr_url and/or qr_ascii to the user; then poll with goquark_login_poll until phase=logged_in",
+
+			// --- QR payload (explicit names) ---
+			"qr_url": map[string]any{
+				"type":        "login_qr_link",
+				"description": "Quark scan-login URL. User opens Quark APP → search-box camera → scan this link/QR.",
+				"value":       sess.QRURL,
+			},
+			"qr_content": map[string]any{
+				"type":        "login_qr_payload_string",
+				"description": "Same string encoded inside the QR image (identical to qr_url.value).",
+				"value":       sess.QRURL,
+			},
+			"qr_png_path": map[string]any{
+				"type":        "local_png_file",
+				"description": "Local PNG of the QR (host filesystem; agent may open if same machine).",
+				"value":       sess.QRPngPath,
+			},
+			"how_to_scan": "夸克 APP → 顶部搜索框旁相机 → 扫码。扫描对象是 qr_url / qr_content，不是普通网页链接。",
+			"next_step":  "Call goquark_login_poll every few seconds until phase is logged_in, expired, or timeout.",
+		}
+		if includeASCII && sess.QRASCII != "" {
+			out["qr_ascii"] = map[string]any{
+				"type":        "login_qr_terminal_art",
+				"description": "Half-block ASCII QR for terminal display. Paste into chat/terminal for the user to scan from screen.",
+				"value":       sess.QRASCII,
+			}
+		}
+		return textJSON(out)
+	})
+
+	s.AddTool(mcp.NewTool("goquark_login_poll",
+		mcp.WithDescription("Poll active QR login started by goquark_login. Returns phase: waiting_scan | logged_in | expired | timeout | error. On logged_in, session is saved and subsequent tools work."),
+	), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		if loginSess == nil || loginSess.Token == "" {
+			// maybe already logged in via CLI
+			if cfg.HasSessionCookie() {
+				return textJSON(map[string]any{
+					"phase":     "logged_in",
+					"logged_in": true,
+					"message":   "session present (no active QR session)",
+				})
+			}
+			return mcp.NewToolResultError("no active login session; call goquark_login first"), nil
+		}
+		res, err := auth.PollQRLogin(cfg, loginSess)
+		if err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
+		// Refresh client after successful login
+		if res.LoggedIn {
+			if reloaded, err := config.Load(cfg.Path()); err == nil {
+				cfg = reloaded
+			}
+			c = client.New(cfg)
+			mgr.BindClient(c)
+		}
+		out := map[string]any{
+			"phase":     res.Phase,
+			"logged_in": res.LoggedIn,
+			"message":   res.Message,
+		}
+		// Echo QR with labels so agent can re-show while waiting
+		if res.QRURL != "" {
+			out["qr_url"] = map[string]any{
+				"type":        "login_qr_link",
+				"description": "Still valid scan URL while phase=waiting_scan",
+				"value":       res.QRURL,
+			}
+			out["qr_content"] = map[string]any{
+				"type":        "login_qr_payload_string",
+				"description": "QR payload string (same as qr_url.value)",
+				"value":       res.QRURL,
+			}
+		}
+		if res.QRASCII != "" {
+			out["qr_ascii"] = map[string]any{
+				"type":        "login_qr_terminal_art",
+				"description": "Terminal QR art",
+				"value":       res.QRASCII,
+			}
+		}
+		if res.LoggedIn {
+			out["user"] = auth.UserInfoFromSession(cfg)
+			out["next_step"] = "Login complete. Use goquark_ls / goquark_download / goquark_whoami."
 		}
 		return textJSON(out)
 	})

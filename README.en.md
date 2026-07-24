@@ -180,11 +180,11 @@ Session cookies stay **local only**. Never commit or share a config that contain
 
 ## MCP
 
-stdio server: host runs `goquark mcp`.
+stdio server: host runs `goquark mcp` (**absolute path** required).
 
-1. Build and install to a fixed path  
-2. Run `goquark login` once  
-3. Use the **absolute path** in the host config  
+1. Install `goquark` to a fixed path  
+2. Add the JSON below to Claude Desktop / Cursor / other hosts  
+3. Agents discover tools automatically (login via QR, browse, download, …)
 
 ### Claude Desktop
 
@@ -215,23 +215,25 @@ stdio server: host runs `goquark mcp`.
 }
 ```
 
+<details>
+<summary>More: MCP tools</summary>
+
 | Tool | Description |
 |------|-------------|
-| `goquark_status` | Login/config/version/download_dir (no cloud API) |
+| `goquark_status` | Login/config/version |
+| `goquark_login` | Start QR login; returns **labeled** `qr_url` / `qr_content` / `qr_ascii` |
+| `goquark_login_poll` | Poll until `logged_in` |
 | `goquark_device` | Local device profile |
-| `goquark_whoami` | Account info + version/update status |
-| `goquark_ls` | List directory (`path`, optional `page`/`size`) |
-| `goquark_stat` | Resolve path or fid → metadata |
-| `goquark_download` | Download file (`remote`, optional `local`/`wait`) |
-| `goquark_downloads` | Download task list (optional `active_only`) |
-| `goquark_download_control` | Control tasks: `pause`/`resume`/`cancel`/`clear_done` |
-| `goquark_check_update` | Check GitHub Release (no download) |
-| `goquark_update` | Check or apply self-update (`apply=true` to install) |
-|
-| `goquark_device` | Device profile |
-| `goquark_whoami` | Logged-in user |
-| `goquark_ls` | List path (`path`, default `/`) |
-| `goquark_download` | Download (`remote`, `local`) |
+| `goquark_whoami` | Account info |
+| `goquark_ls` | List directory |
+| `goquark_stat` | Path / fid metadata |
+| `goquark_download` | Download |
+| `goquark_downloads` | Task list |
+| `goquark_download_control` | Pause / resume / cancel |
+| `goquark_check_update` | Check update |
+| `goquark_update` | Apply update (`apply=true`) |
+
+</details>
 
 ---
 

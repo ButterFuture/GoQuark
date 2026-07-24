@@ -185,11 +185,11 @@ goquark version
 
 ## MCP
 
-通过 **stdio** 提供服务：宿主进程启动 `goquark mcp`。
+通过 **stdio** 提供服务：宿主启动 `goquark mcp`（需**绝对路径**）。
 
-1. 构建并安装到固定路径  
-2. 先执行一次 `goquark login`  
-3. 在宿主中填写**绝对路径**
+1. 安装 `goquark` 到固定路径  
+2. 在 Claude Desktop / Cursor 等宿主里配置下方 JSON  
+3. Agent 可通过工具完成登录（扫码）、浏览、下载等；工具列表由 MCP 宿主自动发现
 
 ### Claude Desktop
 
@@ -220,25 +220,25 @@ goquark version
 }
 ```
 
+<details>
+<summary>更多：MCP工具一览</summary>
+
 | Tool | 说明 |
 |------|------|
-| `goquark_status` | 登录态 / 配置 / 版本 / 下载目录（不调网盘 API） |
+| `goquark_status` | 登录态 / 配置 / 版本 |
+| `goquark_login` | 发起扫码登录，返回 **明确标注** 的 `qr_url` / `qr_content` / `qr_ascii` |
+| `goquark_login_poll` | 轮询扫码结果至 `logged_in` |
 | `goquark_device` | 本地设备信息 |
-| `goquark_whoami` | 当前用户 + 版本/更新状态 |
-| `goquark_ls` | 列目录（`path`，可选 `page`/`size`） |
-| `goquark_stat` | 解析路径或 fid → 元数据 |
-| `goquark_download` | 下载文件（`remote`，可选 `local`/`wait`） |
-| `goquark_downloads` | 下载任务列表（可选 `active_only`） |
-| `goquark_download_control` | 任务控制：`pause`/`resume`/`cancel`/`clear_done` |
-| `goquark_check_update` | 检查 GitHub Release（不下载） |
-| `goquark_update` | 检查或应用自更新（`apply=true` 才真正更新） |
+| `goquark_whoami` | 当前用户 |
+| `goquark_ls` | 列目录 |
+| `goquark_stat` | 路径 / fid 元数据 |
+| `goquark_download` | 下载 |
+| `goquark_downloads` | 下载任务列表 |
+| `goquark_download_control` | 暂停 / 恢复 / 取消 |
+| `goquark_check_update` | 检查更新 |
+| `goquark_update` | 应用更新（`apply=true`） |
 
-**Agent 提示**
-
-1. 先 `goquark_status` 看是否已登录；未登录时请用户在本机执行 `goquark login`（MCP 不发起扫码）。  
-2. 浏览：`goquark_ls` → `goquark_stat` → `goquark_download`。  
-3. 大文件可用 `goquark_download` 且 `wait=false`，再 `goquark_downloads` 轮询。  
-4. 更新默认只检查；真正升级需 `goquark_update` 且 `apply=true`。
+</details>
 
 ---
 
