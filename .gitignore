@@ -1,0 +1,11 @@
+# Ignore build artifacts and secrets
+/goquark
+*.exe
+*.test
+qrcode.png
+qrcode.url.txt
+config.json
+.env
+.DS_Store
+dist/
+bin/
