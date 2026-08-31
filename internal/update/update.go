@@ -3,12 +3,16 @@ package update
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
@@ -20,20 +24,34 @@ const (
 	DefaultRepo = "ButterFuture/GoQuark"
 	// UserAgent for GitHub API.
 	UserAgent = "GoQuark-Updater"
+	// SumsAssetName is the checksum manifest CI publishes next to the binaries.
+	// A release without it cannot be self-applied.
+	SumsAssetName = "SHA256SUMS"
 )
 
 // Result of a check / apply attempt.
 type Result struct {
-	Current       string `json:"current"`
-	Latest        string `json:"latest"`
-	UpdateAvailable bool `json:"update_available"`
-	ReleaseURL    string `json:"release_url,omitempty"`
-	AssetName     string `json:"asset_name,omitempty"`
-	AssetURL      string `json:"asset_url,omitempty"`
-	CanApply      bool   `json:"can_apply"` // matching binary asset exists
-	Reason        string `json:"reason,omitempty"`
-	Applied       bool   `json:"applied,omitempty"`
-	BinaryPath    string `json:"binary_path,omitempty"`
+	Current         string `json:"current"`
+	Latest          string `json:"latest"`
+	UpdateAvailable bool   `json:"update_available"`
+	ReleaseURL      string `json:"release_url,omitempty"`
+	AssetName       string `json:"asset_name,omitempty"`
+	AssetURL        string `json:"asset_url,omitempty"`
+	CanApply        bool   `json:"can_apply"` // matching binary asset + checksum manifest exist
+	Reason          string `json:"reason,omitempty"`
+	Applied         bool   `json:"applied,omitempty"`
+	BinaryPath      string `json:"binary_path,omitempty"`
+
+	// Repo the release was read from. CustomRepo is true when it is not
+	// DefaultRepo; Apply refuses those unless the caller opts in explicitly, so
+	// GOQUARK_UPDATE_REPO alone can never redirect a binary replacement.
+	Repo       string `json:"repo,omitempty"`
+	CustomRepo bool   `json:"custom_repo,omitempty"`
+
+	// SumsURL is the SHA256SUMS asset used for verification; SHA256 is the
+	// digest of the binary that was actually installed.
+	SumsURL string `json:"sums_url,omitempty"`
+	SHA256  string `json:"sha256,omitempty"`
 }
 
 type ghRelease struct {
@@ -44,6 +62,16 @@ type ghRelease struct {
 		BrowserDownloadURL string `json:"browser_download_url"`
 		Size               int64  `json:"size"`
 	} `json:"assets"`
+}
+
+// repoPattern matches "owner/name" and nothing else. The repo is interpolated
+// into an api.github.com path, so it must not carry a scheme, host, traversal
+// or query string.
+var repoPattern = regexp.MustCompile(`^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$`)
+
+// ValidRepo reports whether r is a safe "owner/name" repository reference.
+func ValidRepo(r string) bool {
+	return repoPattern.MatchString(r) && !strings.Contains(r, "..")
 }
 
 // NormalizeVersion strips leading "v" and spaces.
@@ -115,6 +143,9 @@ func Check(ctx context.Context, current, repo string) (*Result, error) {
 	if repo == "" {
 		repo = DefaultRepo
 	}
+	if !ValidRepo(repo) {
+		return nil, fmt.Errorf("invalid update repo %q (want owner/name)", repo)
+	}
 	if current == "" {
 		current = "dev"
 	}
@@ -128,6 +159,8 @@ func Check(ctx context.Context, current, repo string) (*Result, error) {
 		Current:    cur,
 		Latest:     latest,
 		ReleaseURL: rel.HTMLURL,
+		Repo:       repo,
+		CustomRepo: repo != DefaultRepo,
 	}
 	if Compare(cur, latest) >= 0 {
 		res.UpdateAvailable = false
@@ -138,18 +171,32 @@ func Check(ctx context.Context, current, repo string) (*Result, error) {
 	want := ExpectedAssetName(latest)
 	// also accept goquark_{os}_{arch} without version, or with .exe variants
 	for _, a := range rel.Assets {
-		if matchAsset(a.Name, want, latest) {
+		if a.Name == SumsAssetName {
+			if res.SumsURL == "" {
+				res.SumsURL = a.BrowserDownloadURL
+			}
+			continue
+		}
+		if res.AssetURL == "" && matchAsset(a.Name, want, latest) {
 			res.AssetName = a.Name
 			res.AssetURL = a.BrowserDownloadURL
-			res.CanApply = true
-			break
 		}
 	}
-	if !res.CanApply {
+	switch {
+	case res.AssetURL == "":
 		res.Reason = fmt.Sprintf(
 			"new version %s is available, but no release binary for %s/%s (self-built or unsupported platform); download manually: %s",
 			latest, runtime.GOOS, runtime.GOARCH, rel.HTMLURL,
 		)
+	case res.SumsURL == "":
+		// Fail closed: replacing our own executable with an unverified
+		// download is exactly what the checksum manifest exists to prevent.
+		res.Reason = fmt.Sprintf(
+			"new version %s publishes no %s; refusing to self-update without an integrity check — download and verify manually: %s",
+			latest, SumsAssetName, rel.HTMLURL,
+		)
+	default:
+		res.CanApply = true
 	}
 	return res, nil
 }
@@ -183,20 +230,72 @@ func matchAsset(name, want, latest string) bool {
 	return false
 }
 
+// githubHost reports whether h is a host GitHub serves the API and releases
+// from. Update downloads and the API token are both restricted to these: a
+// redirected repo must not be able to hand us a binary from somewhere else, or
+// collect GITHUB_TOKEN on the way.
+func githubHost(h string) bool {
+	h = strings.ToLower(h)
+	switch h {
+	case "github.com", "www.github.com", "api.github.com", "codeload.github.com":
+		return true
+	}
+	return strings.HasSuffix(h, ".githubusercontent.com")
+}
+
+// allowHost gates which hosts the updater will fetch from. It is a var only so
+// tests can point the updater at a local server; production always uses
+// githubHost. setAuth deliberately does NOT consult it, so a token still only
+// ever reaches real GitHub.
+var allowHost = githubHost
+
+// newHTTPClient builds the client used for update fetches. Also a var only so
+// tests can supply one that trusts a local test server's certificate.
+var newHTTPClient = func(timeout time.Duration) *http.Client {
+	return &http.Client{Timeout: timeout}
+}
+
+// requireGitHubURL parses raw and rejects anything that is not https on a
+// GitHub host.
+func requireGitHubURL(raw string) (*url.URL, error) {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return nil, fmt.Errorf("bad update url: %w", err)
+	}
+	if u.Scheme != "https" || !allowHost(u.Hostname()) {
+		return nil, fmt.Errorf("refusing update download from non-GitHub url: %s", raw)
+	}
+	return u, nil
+}
+
+// setAuth attaches a GitHub token, but only when the request actually goes to
+// GitHub.
+func setAuth(req *http.Request) {
+	if !githubHost(req.URL.Hostname()) {
+		return
+	}
+	if t := os.Getenv("GITHUB_TOKEN"); t != "" {
+		req.Header.Set("Authorization", "Bearer "+t)
+		return
+	}
+	if t := os.Getenv("GH_TOKEN"); t != "" {
+		req.Header.Set("Authorization", "Bearer "+t)
+	}
+}
+
 func fetchLatest(ctx context.Context, repo string) (*ghRelease, error) {
-	url := fmt.Sprintf("https://api.github.com/repos/%s/releases/latest", repo)
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	u, err := requireGitHubURL(fmt.Sprintf("https://api.github.com/repos/%s/releases/latest", repo))
+	if err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
 	if err != nil {
 		return nil, err
 	}
 	req.Header.Set("Accept", "application/vnd.github+json")
 	req.Header.Set("User-Agent", UserAgent)
-	if t := os.Getenv("GITHUB_TOKEN"); t != "" {
-		req.Header.Set("Authorization", "Bearer "+t)
-	} else if t := os.Getenv("GH_TOKEN"); t != "" {
-		req.Header.Set("Authorization", "Bearer "+t)
-	}
-	client := &http.Client{Timeout: 30 * time.Second}
+	setAuth(req)
+	client := newHTTPClient(30 * time.Second)
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("github api: %w", err)
@@ -216,15 +315,49 @@ func fetchLatest(ctx context.Context, repo string) (*ghRelease, error) {
 	return &rel, nil
 }
 
-// Apply downloads the asset and replaces the current executable.
+// ApplyOptions carries opt-ins that must originate from an explicit user
+// action rather than from the environment.
+type ApplyOptions struct {
+	// AllowCustomRepo permits installing a binary built from a repository
+	// other than DefaultRepo (goquark update --allow-custom-repo).
+	AllowCustomRepo bool
+}
+
+// Apply downloads the asset, verifies it against the release SHA256SUMS and
+// replaces the current executable.
 // On success the process should typically exit so the new binary is used next start.
 func Apply(ctx context.Context, res *Result) error {
+	return ApplyWithOptions(ctx, res, ApplyOptions{})
+}
+
+// ApplyWithOptions is Apply with explicit opt-ins. It refuses to install from a
+// non-default repository, and never writes the new binary into place before its
+// SHA-256 matches the release manifest.
+func ApplyWithOptions(ctx context.Context, res *Result, opt ApplyOptions) error {
 	if res == nil || !res.UpdateAvailable {
 		return fmt.Errorf("no update available")
 	}
 	if !res.CanApply || res.AssetURL == "" {
 		return fmt.Errorf("%s", res.Reason)
 	}
+	if res.CustomRepo && !opt.AllowCustomRepo {
+		return fmt.Errorf(
+			"refusing to replace the binary with a build from %q instead of %s "+
+				"(GOQUARK_UPDATE_REPO is set); re-run with --allow-custom-repo if that is intended",
+			res.Repo, DefaultRepo,
+		)
+	}
+	if res.SumsURL == "" {
+		return fmt.Errorf("no %s for release %s; refusing to self-update unverified", SumsAssetName, res.Latest)
+	}
+
+	// Fetch the expected digest first — no point downloading if the manifest
+	// does not cover our asset.
+	wantSum, err := fetchExpectedSum(ctx, res.SumsURL, res.AssetName)
+	if err != nil {
+		return err
+	}
+
 	exe, err := os.Executable()
 	if err != nil {
 		return fmt.Errorf("locate executable: %w", err)
@@ -236,10 +369,20 @@ func Apply(ctx context.Context, res *Result) error {
 	res.BinaryPath = exe
 
 	tmp := exe + ".new"
-	if err := downloadFile(ctx, res.AssetURL, tmp); err != nil {
+	gotSum, err := downloadFile(ctx, res.AssetURL, tmp)
+	if err != nil {
 		_ = os.Remove(tmp)
 		return err
 	}
+	if !strings.EqualFold(gotSum, wantSum) {
+		_ = os.Remove(tmp)
+		return fmt.Errorf(
+			"checksum mismatch for %s: %s lists %s, download is %s — update aborted",
+			res.AssetName, SumsAssetName, wantSum, gotSum,
+		)
+	}
+	res.SHA256 = gotSum
+
 	if err := os.Chmod(tmp, 0o755); err != nil {
 		_ = os.Remove(tmp)
 		return err
@@ -265,41 +408,107 @@ func Apply(ctx context.Context, res *Result) error {
 	return nil
 }
 
-func downloadFile(ctx context.Context, url, dest string) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+// fetchExpectedSum reads the SHA256SUMS manifest and returns the digest listed
+// for asset. Lines are "<hex>  <name>" or "<hex> *<name>" (sha256sum output).
+// An asset the manifest does not cover is an error, not a skipped check.
+func fetchExpectedSum(ctx context.Context, sumsURL, asset string) (string, error) {
+	u, err := requireGitHubURL(sumsURL)
 	if err != nil {
-		return err
+		return "", err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	if err != nil {
+		return "", err
 	}
 	req.Header.Set("User-Agent", UserAgent)
-	if t := os.Getenv("GITHUB_TOKEN"); t != "" {
-		req.Header.Set("Authorization", "Bearer "+t)
-	}
-	client := &http.Client{Timeout: 10 * time.Minute}
+	setAuth(req)
+	client := newHTTPClient(60 * time.Second)
 	resp, err := client.Do(req)
 	if err != nil {
-		return err
+		return "", fmt.Errorf("fetch %s: %w", SumsAssetName, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return "", fmt.Errorf("fetch %s: %s", SumsAssetName, resp.Status)
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return "", err
+	}
+	return sumForAsset(body, asset)
+}
+
+// sumForAsset returns the digest the manifest lists for asset. Lines are
+// "<hex>  <name>" or "<hex> *<name>" (sha256sum output). The name is compared
+// exactly, so a request for goquark_1.0.2_linux_amd64 can never be satisfied by
+// the goquark_1.0.2_linux_amd64.exe line that contains it as a prefix.
+func sumForAsset(manifest []byte, asset string) (string, error) {
+	for _, line := range strings.Split(string(manifest), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) != 2 {
+			continue
+		}
+		if filepath.Base(strings.TrimPrefix(fields[1], "*")) != asset {
+			continue
+		}
+		sum := strings.ToLower(fields[0])
+		if len(sum) != 64 {
+			return "", fmt.Errorf("%s: malformed digest for %s", SumsAssetName, asset)
+		}
+		if _, err := hex.DecodeString(sum); err != nil {
+			return "", fmt.Errorf("%s: malformed digest for %s", SumsAssetName, asset)
+		}
+		return sum, nil
+	}
+	return "", fmt.Errorf("%s does not list %s; refusing to self-update unverified", SumsAssetName, asset)
+}
+
+// downloadFile fetches url into dest and returns the hex SHA-256 of the bytes
+// it wrote, so the caller can verify before installing.
+func downloadFile(ctx context.Context, rawURL, dest string) (string, error) {
+	u, err := requireGitHubURL(rawURL)
+	if err != nil {
+		return "", err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("User-Agent", UserAgent)
+	setAuth(req)
+	client := newHTTPClient(10 * time.Minute)
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != 200 {
 		b, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-		return fmt.Errorf("download %s: %s", resp.Status, strings.TrimSpace(string(b)))
+		return "", fmt.Errorf("download %s: %s", resp.Status, strings.TrimSpace(string(b)))
 	}
 	f, err := os.OpenFile(dest, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o755)
 	if err != nil {
-		return err
+		return "", err
 	}
-	_, copyErr := io.Copy(f, resp.Body)
+	h := sha256.New()
+	_, copyErr := io.Copy(io.MultiWriter(f, h), resp.Body)
 	closeErr := f.Close()
 	if copyErr != nil {
-		return copyErr
+		return "", copyErr
 	}
-	return closeErr
+	if closeErr != nil {
+		return "", closeErr
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
-// RepoFromEnv returns GOQUARK_UPDATE_REPO or DefaultRepo.
+// RepoFromEnv returns GOQUARK_UPDATE_REPO or DefaultRepo. A malformed value
+// falls back to DefaultRepo rather than being interpolated into an API URL;
+// a well-formed override still cannot drive Apply on its own (see ApplyOptions).
 func RepoFromEnv() string {
-	if r := strings.TrimSpace(os.Getenv("GOQUARK_UPDATE_REPO")); r != "" {
-		return r
+	r := strings.TrimSpace(os.Getenv("GOQUARK_UPDATE_REPO"))
+	if r == "" || !ValidRepo(r) {
+		return DefaultRepo
 	}
-	return DefaultRepo
+	return r
 }

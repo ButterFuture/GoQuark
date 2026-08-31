@@ -299,7 +299,7 @@ func Run(cfg *config.Config, opts Options) error {
 		spinner:     sp,
 		stack:       []navFrame{{fid: "0", path: "/", name: "根目录"}},
 		selected:    map[int]bool{},
-		loginQRPath: "qrcode.png",
+		loginQRPath: filepath.Join(filepath.Dir(cfg.Path()), "qrcode.png"),
 		dlMgr:       mgr,
 		appVersion:  ver,
 	}
@@ -393,7 +393,7 @@ func (m model) startLogin() tea.Cmd {
 		go func() {
 			_, err := auth.LoginQR(cfg, auth.Options{
 				QRPngPath:  qrPath,
-				QRURLPath:  "qrcode.url.txt",
+				QRURLPath:  filepath.Join(filepath.Dir(qrPath), "qrcode.url.txt"),
 				PrintASCII: false,
 				Quiet:      true,
 				Timeout:    5 * time.Minute,
@@ -3016,14 +3016,9 @@ func humanSize(n int64) string {
 	return fmt.Sprintf("%.1f PiB", f/1024)
 }
 
-func sanitizeName(name string) string {
-	name = strings.ReplaceAll(name, "/", "_")
-	name = strings.ReplaceAll(name, "\x00", "")
-	if name == "" || name == "." || name == ".." {
-		return "download.bin"
-	}
-	return name
-}
+// sanitizeName delegates to the download package so the TUI and the download
+// manager cannot drift apart on what a safe file name is.
+func sanitizeName(name string) string { return download.SanitizeFilename(name) }
 
 func strAny(v any) string {
 	if v == nil {

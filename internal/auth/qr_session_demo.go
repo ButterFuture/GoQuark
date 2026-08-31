@@ -5,7 +5,6 @@ package auth
 import (
 	"encoding/json"
 	"fmt"
-	"os"
 	"time"
 
 	"github.com/ButterFuture/GoQuark/internal/config"
@@ -21,8 +20,7 @@ func startQRLoginDemo(cfg *config.Config, opt Options) (*QRSession, error) {
 	seed := demobuild.HostSeed()
 	token := fmt.Sprintf("demo-token-%s", demobuild.FakeMachineID(seed)[:12])
 	qrURL := "https://example.invalid/goquark-demo/scan?token=" + token
-	_ = os.WriteFile(opt.QRURLPath, []byte(qrURL+"\n"), 0o644)
-	if err := qrcode.WriteFile(qrURL, qrcode.Medium, 320, opt.QRPngPath); err != nil {
+	if err := writeQRFiles(qrURL, opt.QRPngPath, opt.QRURLPath); err != nil {
 		return nil, err
 	}
 	ascii := ""

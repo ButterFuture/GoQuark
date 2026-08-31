@@ -116,7 +116,7 @@ Usage:
   goquark download <remote-path|fid> <local-path> [--config PATH]
   goquark download <remote-path|fid> [--config PATH]   # saves to download_dir
   goquark downloads [--watch] [--config PATH] [--json]
-  goquark update [--check] [--yes] [--json]   # check / apply update from GitHub Release
+  goquark update [--check] [--yes] [--allow-custom-repo] [--json]   # check / apply update from GitHub Release
   goquark tui [--config PATH]
   goquark mcp
   goquark version
@@ -565,6 +565,8 @@ func cmdUpdate(args []string) {
 	checkOnly := fs.Bool("check", false, "only check, do not apply")
 	yes := fs.Bool("yes", false, "download and replace binary if update available")
 	jsonOut := fs.Bool("json", false, "JSON output")
+	allowCustomRepo := fs.Bool("allow-custom-repo", false,
+		"permit installing a build from a repo other than "+update.DefaultRepo)
 	_ = fs.Parse(args)
 	// aliases: --check is default when no --yes
 	if !*yes {
@@ -592,8 +594,15 @@ func cmdUpdate(args []string) {
 			}
 			os.Exit(2)
 		}
+		if res.CustomRepo {
+			fmt.Fprintf(os.Stderr,
+				"警告: 将从 %s 安装（非官方仓库 %s），来源由 GOQUARK_UPDATE_REPO 指定\n",
+				res.Repo, update.DefaultRepo)
+		}
 		fmt.Fprintf(os.Stderr, "正在下载 %s …\n", res.AssetName)
-		if err := update.Apply(ctx, res); err != nil {
+		if err := update.ApplyWithOptions(ctx, res, update.ApplyOptions{
+			AllowCustomRepo: *allowCustomRepo,
+		}); err != nil {
 			fatal(err)
 		}
 		if wantJSON {

@@ -24,7 +24,11 @@ jobs:
 
       - uses: actions/setup-go@v5
         with:
-          go-version-file: go.mod
+          # Build with a current patched toolchain rather than the minimum in
+          # go.mod: release binaries statically carry the Go standard library,
+          # so an old toolchain ships its unpatched net/http, crypto/tls and
+          # crypto/x509 to every user.
+          go-version: stable
 
       - name: Go vet / test
         run: |
@@ -55,7 +59,11 @@ jobs:
 
       - uses: actions/setup-go@v5
         with:
-          go-version-file: go.mod
+          # Build with a current patched toolchain rather than the minimum in
+          # go.mod: release binaries statically carry the Go standard library,
+          # so an old toolchain ships its unpatched net/http, crypto/tls and
+          # crypto/x509 to every user.
+          go-version: stable
 
       - name: Read VERSION
         id: ver

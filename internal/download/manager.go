@@ -1218,18 +1218,29 @@ func FormatDuration(d time.Duration) string {
 	return fmt.Sprintf("%dd%02dh", days, h)
 }
 
-func sanitize(name string) string {
+// SanitizeFilename makes a server-supplied file name safe to join onto a
+// destination directory on any OS. Both separators are stripped (Windows
+// treats "\\" as one, so replacing only "/" would leave "..\\..\\x" able to
+// escape the download dir), along with the drive-letter colon, control
+// characters, and the trailing dots/spaces Windows silently drops. A name that
+// reduces to "." or ".." would resolve to a directory rather than a file.
+func SanitizeFilename(name string) string {
 	out := make([]rune, 0, len(name))
 	for _, r := range name {
-		switch r {
-		case '/', '\\', ':', '*', '?', '"', '<', '>', '|':
+		switch {
+		case r == '/', r == '\\', r == ':', r == '*', r == '?', r == '"', r == '<', r == '>', r == '|':
 			out = append(out, '_')
+		case r < 0x20 || r == 0x7f: // control chars, incl. NUL
+			continue
 		default:
 			out = append(out, r)
 		}
 	}
-	if len(out) == 0 {
+	s := strings.TrimRight(strings.Trim(string(out), " "), ". ")
+	if s == "" || s == "." || s == ".." {
 		return "download.bin"
 	}
-	return string(out)
+	return s
 }
+
+func sanitize(name string) string { return SanitizeFilename(name) }

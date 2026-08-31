@@ -5,7 +5,6 @@ package auth
 import (
 	"encoding/json"
 	"fmt"
-	"os"
 	"time"
 
 	"github.com/ButterFuture/GoQuark/internal/config"
@@ -17,7 +16,7 @@ import (
 // loginQRDemo is the full mock login path for goquarkdemo.
 // Fake QR → wait 5–10s → success session (no network).
 func loginQRDemo(cfg *config.Config, opt Options) (*LoginResult, error) {
-	defaultOpts(&opt)
+	defaultOpts(&opt, cfg)
 
 	// Demo device identity (host-stable, distinct from product)
 	if err := device.EnsureDevice(cfg, ""); err != nil {
@@ -29,8 +28,7 @@ func loginQRDemo(cfg *config.Config, opt Options) (*LoginResult, error) {
 	token := fmt.Sprintf("demo-token-%s", demobuild.FakeMachineID(seed)[:12])
 	qrURL := "https://example.invalid/goquark-demo/scan?token=" + token
 
-	_ = os.WriteFile(opt.QRURLPath, []byte(qrURL+"\n"), 0o644)
-	if err := qrcode.WriteFile(qrURL, qrcode.Medium, 320, opt.QRPngPath); err != nil {
+	if err := writeQRFiles(qrURL, opt.QRPngPath, opt.QRURLPath); err != nil {
 		return nil, err
 	}
 	ascii := ""

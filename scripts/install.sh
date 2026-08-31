@@ -139,28 +139,33 @@ if ! curl -fL --retry 3 -o "${tmp}/${asset}" "$asset_url"; then
 fi
 
 echo "==> download ${sums} (checksum)"
-if curl -fL --retry 3 -o "${tmp}/${sums}" "$sums_url" 2>/dev/null; then
-  (
-    cd "$tmp"
-    # line may be "hash  name" or "hash *name"
-    if grep -E "[[:space:]]${asset}\$" "$sums" >/dev/null 2>&1 || grep -F "$asset" "$sums" >/dev/null 2>&1; then
-      # verify only our file
-      expected="$(grep -F "$asset" "$sums" | head -1 | awk '{print $1}')"
-      actual="$("${SHA_CMD[@]}" "$asset" | awk '{print $1}')"
-      if [[ "$expected" != "$actual" ]]; then
-        echo "ERROR: checksum mismatch for ${asset}" >&2
-        echo "  expected: $expected" >&2
-        echo "  actual:   $actual" >&2
-        exit 1
-      fi
-      echo "==> checksum OK"
-    else
-      echo "WARN: ${asset} not listed in SHA256SUMS — skip verify" >&2
-    fi
-  )
-else
-  echo "WARN: SHA256SUMS not found — skip verify" >&2
+# Fail closed: an unverified binary is never installed. Every release built by
+# CI publishes SHA256SUMS, so a missing or non-matching entry means something
+# is wrong with the release, not with the check.
+if ! curl -fL --retry 3 -o "${tmp}/${sums}" "$sums_url"; then
+  echo "ERROR: ${sums} not found for ${tag} — refusing to install unverified" >&2
+  echo "       ${sums_url}" >&2
+  exit 1
 fi
+(
+  cd "$tmp"
+  # sha256sum lines are "<hash>  <name>" or "<hash> *<name>"; match the name
+  # field exactly so goquark_x_linux_amd64 cannot match ..._amd64.exe.
+  expected="$(awk -v want="$asset" \
+    '{ name = $2; sub(/^\*/, "", name); if (name == want) { print $1; exit } }' "$sums")"
+  if [[ -z "$expected" ]]; then
+    echo "ERROR: ${asset} is not listed in ${sums} — refusing to install unverified" >&2
+    exit 1
+  fi
+  actual="$("${SHA_CMD[@]}" "$asset" | awk '{print $1}')"
+  if [[ "$expected" != "$actual" ]]; then
+    echo "ERROR: checksum mismatch for ${asset}" >&2
+    echo "  expected: $expected" >&2
+    echo "  actual:   $actual" >&2
+    exit 1
+  fi
+  echo "==> checksum OK"
+)
 
 dest="${INSTALL_DIR}/${BIN_NAME}"
 [[ "$os" == "windows" ]] && dest="${INSTALL_DIR}/${BIN_NAME}.exe"

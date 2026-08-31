@@ -8,6 +8,7 @@ import (
 	"net/http/cookiejar"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -50,12 +51,13 @@ type Options struct {
 	OnQR func(qrURL, ascii string)
 }
 
-func defaultOpts(o *Options) {
+func defaultOpts(o *Options, cfg *config.Config) {
+	dir := qrDir(cfg)
 	if o.QRPngPath == "" {
-		o.QRPngPath = "qrcode.png"
+		o.QRPngPath = filepath.Join(dir, "qrcode.png")
 	}
 	if o.QRURLPath == "" {
-		o.QRURLPath = "qrcode.url.txt"
+		o.QRURLPath = filepath.Join(dir, "qrcode.url.txt")
 	}
 	if o.Timeout <= 0 {
 		o.Timeout = 3 * time.Minute
@@ -68,13 +70,42 @@ func defaultOpts(o *Options) {
 	}
 }
 
+// qrDir returns the directory for transient QR artifacts. The encoded URL is a
+// live login token until it is scanned or expires, so it belongs next to the
+// config (0700) rather than in the working directory, where it could be
+// committed to a repo or read by other users on a shared machine.
+func qrDir(cfg *config.Config) string {
+	path := config.DefaultPath()
+	if cfg != nil && cfg.Path() != "" {
+		path = cfg.Path()
+	}
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return "."
+	}
+	return dir
+}
+
+// writeQRFiles writes the QR artifacts 0600 — same reason as qrDir. The .txt
+// copy is best-effort; a missing PNG is fatal because it is what the user scans.
+func writeQRFiles(qrURL, pngPath, urlPath string) error {
+	if urlPath != "" {
+		_ = os.WriteFile(urlPath, []byte(qrURL+"\n"), 0o600)
+	}
+	png, err := qrcode.Encode(qrURL, qrcode.Medium, 320)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(pngPath, png, 0o600)
+}
+
 // LoginQR runs official PC QR login flow and persists session into cfg.
 // Demo builds (-tags demo / goquarkdemo) use a full mock path (fake QR, auto success).
 func LoginQR(cfg *config.Config, opt Options) (*LoginResult, error) {
 	if demobuild.Enabled {
 		return loginQRDemo(cfg, opt)
 	}
-	defaultOpts(&opt)
+	defaultOpts(&opt, cfg)
 	if err := device.EnsureDevice(cfg, ""); err != nil {
 		return nil, err
 	}
@@ -88,8 +119,7 @@ func LoginQR(cfg *config.Config, opt Options) (*LoginResult, error) {
 		return nil, err
 	}
 	qrURL := buildScanURL(token)
-	_ = os.WriteFile(opt.QRURLPath, []byte(qrURL+"\n"), 0o644)
-	if err := qrcode.WriteFile(qrURL, qrcode.Medium, 320, opt.QRPngPath); err != nil {
+	if err := writeQRFiles(qrURL, opt.QRPngPath, opt.QRURLPath); err != nil {
 		return nil, err
 	}
 	ascii := ""

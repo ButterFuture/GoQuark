@@ -11,6 +11,30 @@ Versioning follows the root [`VERSION`](../VERSION) file (semver).
 
 ### Changed
 
+## [1.0.3] — 2026-08-31
+
+### Security
+- Self-update verifies the release `SHA256SUMS` before replacing the binary; a
+  digest mismatch, a missing manifest, or an asset the manifest does not list
+  aborts the update
+- Installing a build from a repository other than `ButterFuture/GoQuark` now
+  requires `goquark update --allow-custom-repo`, so `GOQUARK_UPDATE_REPO` alone
+  can no longer redirect a binary replacement
+- Update downloads are restricted to GitHub hosts, and `GITHUB_TOKEN` /
+  `GH_TOKEN` are only ever sent there
+- Download file names strip both path separators, so a server-supplied
+  `..\..\name` can no longer escape the download directory on Windows
+- QR login artifacts (`qrcode.png`, `qrcode.url.txt`) move from the working
+  directory into the config directory and are written `0600` — the encoded URL
+  is a live login token until it is scanned or expires
+- `scripts/install.sh` fails closed when `SHA256SUMS` is absent or does not list
+  the asset, and matches the asset name exactly instead of by substring
+
+### Changed
+- Dependency `cloudflare/circl` 1.3.7 → 1.6.3 (GO-2026-4550, GO-2025-3754)
+- CI builds with a current patched Go toolchain rather than the `go.mod`
+  minimum: release binaries carry the standard library statically
+
 ## [1.0.2] — 2026-07-25
 
 ### Added

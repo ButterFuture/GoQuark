@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/cookiejar"
-	"os"
 	"time"
 
 	"github.com/ButterFuture/GoQuark/internal/config"
@@ -32,7 +31,7 @@ type QRSession struct {
 // StartQRLogin fetches a QR token and returns scan content without blocking.
 // Does not wait for the user to scan — call PollQRLogin afterwards.
 func StartQRLogin(cfg *config.Config, opt Options) (*QRSession, error) {
-	defaultOpts(&opt)
+	defaultOpts(&opt, cfg)
 	if err := device.EnsureDevice(cfg, ""); err != nil {
 		return nil, err
 	}
@@ -48,8 +47,7 @@ func StartQRLogin(cfg *config.Config, opt Options) (*QRSession, error) {
 		return nil, err
 	}
 	qrURL := buildScanURL(token)
-	_ = os.WriteFile(opt.QRURLPath, []byte(qrURL+"\n"), 0o644)
-	if err := qrcode.WriteFile(qrURL, qrcode.Medium, 320, opt.QRPngPath); err != nil {
+	if err := writeQRFiles(qrURL, opt.QRPngPath, opt.QRURLPath); err != nil {
 		return nil, err
 	}
 	ascii := ""
