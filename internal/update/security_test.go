@@ -228,4 +228,18 @@ func TestApplyAbortsOnChecksumMismatch(t *testing.T) {
 	if _, err := os.Stat(exe + ".new"); !os.IsNotExist(err) {
 		t.Error("staged .new file was left behind after abort")
 	}
+	// The staged download now gets a unique name, so check the whole directory
+	// rather than one path.
+	entries, err := os.ReadDir(filepath.Dir(exe))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), stagePrefix) {
+			t.Errorf("staging file %s left behind after abort", e.Name())
+		}
+		if strings.HasSuffix(e.Name(), lockName) {
+			t.Errorf("update lock %s left behind after abort", e.Name())
+		}
+	}
 }

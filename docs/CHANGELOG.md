@@ -11,6 +11,33 @@ Versioning follows the root [`VERSION`](../VERSION) file (semver).
 
 ### Changed
 
+## [1.0.5] — 2026-10-22
+
+### Added
+- The update dialog and `goquark update` show the release notes. In the TUI
+  they collapse to six lines with a `d` / clickable expand button; the text is
+  stripped of escape sequences and capped before it reaches the terminal
+
+### Fixed
+- Self-update staged the download at a fixed `goquark.new`, so two updaters at
+  once — the TUI and the MCP server, say — raced: whichever installed first
+  left the other reporting `chmod ...goquark.new: no such file or directory`
+  even though the update had succeeded. Staging now uses a unique name under a
+  lock, and a second updater is told to wait instead
+- An update is now also serialised within one process, so a caller that starts
+  several update goroutines downloads the release once rather than once per
+  goroutine. Both cases report `update.ErrUpdateInProgress`, which the TUI and
+  CLI present as "wait for the running update" rather than as a failure
+- Self-update no longer unlinks the running binary when it cannot be moved
+  aside; a failure at that point used to leave nothing to run
+- Windows cannot delete the image of a running process, so the replaced binary
+  stayed behind after every update. It is now expected, reported, and removed
+  at the next start, along with any staging file an interrupted download left
+
+### Changed
+- The GitHub Release body is now the CHANGELOG section for that version,
+  instead of only a link to the commit comparison
+
 ## [1.0.4] — 2026-10-22
 
 ### Security

@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -34,6 +35,12 @@ var (
 )
 
 func main() {
+	// A previous update can leave its replaced image behind: Windows will not
+	// let the binary of a running process be deleted, so the old one is still
+	// on disk when that process finally exits. Clear it, and any staging file
+	// an interrupted download left, on the way in.
+	update.CleanupLeftovers()
+
 	if len(os.Args) < 2 {
 		usage()
 		os.Exit(1)
@@ -557,9 +564,10 @@ func cmdTUI(args []string) {
 }
 
 // cmdUpdate: passive check / apply from public GitHub Release.
-//   goquark update           → check only
-//   goquark update --check   → check only
-//   goquark update --yes     → download & replace if possible
+//
+//	goquark update           → check only
+//	goquark update --check   → check only
+//	goquark update --yes     → download & replace if possible
 func cmdUpdate(args []string) {
 	fs := flag.NewFlagSet("update", flag.ExitOnError)
 	checkOnly := fs.Bool("check", false, "only check, do not apply")
@@ -603,6 +611,10 @@ func cmdUpdate(args []string) {
 		if err := update.ApplyWithOptions(ctx, res, update.ApplyOptions{
 			AllowCustomRepo: *allowCustomRepo,
 		}); err != nil {
+			if errors.Is(err, update.ErrUpdateInProgress) {
+				fmt.Fprintln(os.Stderr, "已有一个 GoQuark 更新正在进行，请等它结束后重试。")
+				os.Exit(3)
+			}
 			fatal(err)
 		}
 		if wantJSON {
@@ -610,6 +622,9 @@ func cmdUpdate(args []string) {
 			fmt.Println(string(b))
 		} else {
 			fmt.Printf("已更新到 %s\n路径: %s\n请重新运行 goquark。\n", res.Latest, res.BinaryPath)
+			if res.PendingCleanup != "" {
+				fmt.Printf("旧版本仍被当前进程占用，将在下次启动时清理：%s\n", res.PendingCleanup)
+			}
 		}
 		return
 	}
@@ -626,6 +641,14 @@ func cmdUpdate(args []string) {
 	fmt.Printf("发现新版本：%s → %s\n", res.Current, res.Latest)
 	if res.ReleaseURL != "" {
 		fmt.Printf("发布页：%s\n", res.ReleaseURL)
+	}
+	if res.Notes != "" {
+		fmt.Println()
+		fmt.Println("更新说明：")
+		for _, line := range strings.Split(res.Notes, "\n") {
+			fmt.Println("  " + line)
+		}
+		fmt.Println()
 	}
 	if res.CanApply {
 		fmt.Printf("可自动更新资产：%s\n", res.AssetName)

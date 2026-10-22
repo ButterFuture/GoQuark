@@ -10,6 +10,7 @@ package tui
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -65,10 +66,10 @@ var (
 
 	// unfocused rows: folder blue, file light green.
 	// desc dim gray normally; under selection highlight becomes white.
-	nameDir    = lipgloss.NewStyle().Foreground(lipgloss.Color("117")) // blue folders
-	nameFile   = lipgloss.NewStyle().Foreground(lipgloss.Color("114")) // light green files
-	descDim    = lipgloss.NewStyle().Foreground(lipgloss.Color("243")) // attributes (normal)
-	descOnSel  = lipgloss.NewStyle().Foreground(lipgloss.Color("15"))  // attributes on highlight
+	nameDir   = lipgloss.NewStyle().Foreground(lipgloss.Color("117")) // blue folders
+	nameFile  = lipgloss.NewStyle().Foreground(lipgloss.Color("114")) // light green files
+	descDim   = lipgloss.NewStyle().Foreground(lipgloss.Color("243")) // attributes (normal)
+	descOnSel = lipgloss.NewStyle().Foreground(lipgloss.Color("15"))  // attributes on highlight
 
 	menuBox    = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(lipgloss.Color("39")).Background(lipgloss.Color("235")).Padding(0, 1)
 	menuItemSt = lipgloss.NewStyle().Foreground(lipgloss.Color("252"))
@@ -84,7 +85,7 @@ var (
 	btnOKHover     = lipgloss.NewStyle().Foreground(lipgloss.Color("15")).Background(lipgloss.Color("97")).Padding(0, 2).Bold(true)
 	btnCancelHover = lipgloss.NewStyle().Foreground(lipgloss.Color("15")).Background(lipgloss.Color("61")).Padding(0, 2).Bold(true)
 	// gap between buttons must match modal bg (235), not terminal default
-	btnGapSt = lipgloss.NewStyle().Background(lipgloss.Color("235")).Render("  ")
+	btnGapSt   = lipgloss.NewStyle().Background(lipgloss.Color("235")).Render("  ")
 	panelStyle = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(lipgloss.Color("240")).Padding(1, 2)
 )
 
@@ -131,11 +132,11 @@ type model struct {
 	rows  []row
 
 	// selection
-	cursor   int            // keyboard / focus index into rows
-	selected map[int]bool   // multi-select set
-	offset   int            // scroll offset
-	listTop  int            // y of first list row on screen
-	listH    int            // visible rows
+	cursor   int          // keyboard / focus index into rows
+	selected map[int]bool // multi-select set
+	offset   int          // scroll offset
+	listTop  int          // y of first list row on screen
+	listH    int          // visible rows
 
 	// mouse double-click
 	lastClickIdx  int
@@ -164,6 +165,10 @@ type model struct {
 	// mouse hover: 0=none 1=primary 2=secondary. When non-zero, overrides
 	// keyboard focus for highlight; left/right keys are disabled.
 	btnHover int
+
+	// notesExpanded toggles the release notes in the update dialog between a
+	// few lines and the full text.
+	notesExpanded bool
 	// last rendered overlay geometry (for mouse hit testing)
 	ovX, ovY, ovW, ovH int
 	// confirm button rows/cols relative to overlay top-left (screen coords filled after render)
@@ -192,7 +197,7 @@ type model struct {
 	// local file conflict queue (replace vs rename)
 	conflictQ []dlConflict
 	// highlight task id briefly in downloads center
-	dlFocusID string
+	dlFocusID    string
 	dlFocusUntil time.Time
 
 	// login
@@ -221,8 +226,8 @@ type dlTickMsg struct{}
 type resumeAskMsg struct{ n int }
 
 type updateCheckMsg struct {
-	res *update.Result
-	err error
+	res    *update.Result
+	err    error
 	manual bool
 }
 
@@ -237,10 +242,10 @@ type dlJob struct {
 	replace              bool // delete existing dest before download
 }
 type dlEnqueueMsg struct {
-	jobs     []dlJob
-	focusID  string // jump/highlight existing task
-	status   string
-	err      error
+	jobs    []dlJob
+	focusID string // jump/highlight existing task
+	status  string
+	err     error
 	// conflicts deferred to UI
 	conflicts []dlConflict
 }
@@ -696,27 +701,30 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.updateRes = res
 		m.updateManual = msg.manual
-		body := fmt.Sprintf("发现新版本 %s（当前 %s）\n", res.Latest, res.Current)
-		if res.CanApply {
-			body += "点击「立即更新」即可安装。"
-		} else {
-			body += "无法自动更新（自编译或无对应平台包），请到发布页手动下载。"
-			if res.ReleaseURL != "" {
-				body += "\n" + res.ReleaseURL
-			}
-		}
-		return m.showConfirm("发现新版本", body, "update_available"), nil
+		m.notesExpanded = false
+		return m.showConfirm("发现新版本", m.updateConfirmBody(), "update_available"), nil
 
 	case updateApplyMsg:
 		m.loading = false
 		if msg.err != nil {
+			if errors.Is(msg.err, update.ErrUpdateInProgress) {
+				// A second trigger, not a failure — the first one is still
+				// downloading and will report on its own.
+				return m.showModal("更新进行中",
+					"已有一个更新正在进行，请等它结束。", "info", modeBrowse), nil
+			}
 			return m.showModal("更新失败", msg.err.Error(), "error", modeBrowse), nil
 		}
 		ver := ""
 		if msg.res != nil {
 			ver = msg.res.Latest
 		}
-		return m.showModal("更新完成", "已安装 "+ver+"\n请退出后重新启动 GoQuark。", "info", modeBrowse), nil
+		done := "已安装 " + ver + "\n请退出后重新启动 GoQuark。"
+		if msg.res != nil && msg.res.PendingCleanup != "" {
+			// Windows keeps the old image locked while this process runs it.
+			done += "\n旧版本文件会在下次启动时自动清理。"
+		}
+		return m.showModal("更新完成", done, "info", modeBrowse), nil
 
 	case pauseDoneMsg:
 		m.quitting = false
@@ -798,7 +806,6 @@ func (m model) showConfirm(title, body, action string) model {
 	m.mode = modeModal
 	return m
 }
-
 
 // confirmLabels returns primary/secondary button captions for the current confirm modal.
 // Primary (okLabel) is the default focus (btnFocus=1) and Esc target.
@@ -930,6 +937,12 @@ func (m model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 			// Accept both press and release — some terminals only emit one.
 			if msg.Button == tea.MouseButtonLeft &&
 				(msg.Action == tea.MouseActionRelease || msg.Action == tea.MouseActionPress) {
+				if m.notesToggleHit(msg.X, msg.Y) {
+					if msg.Action == tea.MouseActionRelease {
+						return m.toggleUpdateNotes(), nil
+					}
+					return m, nil
+				}
 				if m.hitOK(msg.X, msg.Y) {
 					return m.activateConfirmBtn(1)
 				}
@@ -1154,6 +1167,12 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			}
 			m.mode = m.modalBack
 			m.confirmAction = ""
+			return m, nil
+		case "d":
+			// release notes expand / collapse
+			if m.modalKind == "confirm" && m.confirmAction == "update_available" {
+				return m.toggleUpdateNotes(), nil
+			}
 			return m, nil
 		case "n":
 			// explicit secondary / cancel
@@ -2260,7 +2279,7 @@ func (m model) renderDownloadItem(s download.Snapshot, focused bool, dlRoot stri
 	// finalizing / pausing: spinner so UI never looks frozen
 	prefix := stStyle.Render(stLabel)
 	if s.Status == download.StatusFinalizing || s.Status == download.StatusPausing {
-		prefix = stStyle.Render(m.spinner.View()+" "+stLabel)
+		prefix = stStyle.Render(m.spinner.View() + " " + stLabel)
 	}
 	nameLine := prefix + sp + nameSt.Render(s.Name)
 
@@ -2539,6 +2558,148 @@ func (m model) viewProfile() string {
 	return b.String()
 }
 
+// Release-notes block inside the update dialog. Children of confirmBox must
+// set both foreground and background, or terminals that do not inherit the
+// box background paint them on the default one.
+var (
+	notesHeadSt = lipgloss.NewStyle().
+			Bold(true).
+			Foreground(lipgloss.Color("45")).
+			Background(lipgloss.Color("235"))
+	notesBodySt = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("250")).
+			Background(lipgloss.Color("235"))
+	notesToggleSt = lipgloss.NewStyle().
+			Bold(true).
+			Foreground(lipgloss.Color("235")).
+			Background(lipgloss.Color("45"))
+	notesHintSt = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("241")).
+			Background(lipgloss.Color("235"))
+)
+
+const (
+	// updateNotesWidth matches the confirm box's inner width.
+	updateNotesWidth = 44
+	// updateNotesCollapsed is how many lines of notes show before the reader
+	// asks for the rest.
+	updateNotesCollapsed = 6
+)
+
+// updateNotesLines wraps the release notes to the dialog width. The text has
+// already been stripped of escape sequences by the update package.
+func updateNotesLines(notes string) []string {
+	if strings.TrimSpace(notes) == "" {
+		return nil
+	}
+	wrapped := lipgloss.NewStyle().Width(updateNotesWidth).Render(notes)
+	return strings.Split(strings.TrimRight(wrapped, "\n"), "\n")
+}
+
+// updateNotesMaxLines is how many note lines the expanded dialog may use
+// before it would run off a short terminal.
+func (m model) updateNotesMaxLines() int {
+	// title, version lines, blanks, heading, toggle, buttons, hint, borders
+	const chrome = 16
+	if avail := m.height - chrome; avail > updateNotesCollapsed {
+		return avail
+	}
+	return updateNotesCollapsed
+}
+
+// notesToggleLabel is both the rendered button text and what notesToggleHit
+// looks for in the rendered modal, so the two cannot drift apart.
+func (m model) notesToggleLabel(total int) string {
+	if m.notesExpanded {
+		return "▴ d 收起说明"
+	}
+	return fmt.Sprintf("▾ d 展开完整说明（共 %d 行）", total)
+}
+
+// updateConfirmBody renders the "new version" dialog: the version line, then
+// the release notes, collapsed until the reader expands them.
+func (m model) updateConfirmBody() string {
+	res := m.updateRes
+	if res == nil {
+		return ""
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "发现新版本 %s（当前 %s）\n", res.Latest, res.Current)
+	if res.CanApply {
+		b.WriteString("点击「立即更新」即可安装。")
+	} else {
+		b.WriteString("无法自动更新（自编译或无对应平台包），请到发布页手动下载。")
+		if res.ReleaseURL != "" {
+			b.WriteString("\n" + res.ReleaseURL)
+		}
+	}
+
+	lines := updateNotesLines(res.Notes)
+	if len(lines) == 0 {
+		return b.String()
+	}
+
+	shown := lines
+	clipped := false
+	if m.notesExpanded {
+		if maxLines := m.updateNotesMaxLines(); len(lines) > maxLines {
+			shown, clipped = lines[:maxLines], true
+		}
+	} else if len(lines) > updateNotesCollapsed {
+		shown = lines[:updateNotesCollapsed]
+	}
+
+	b.WriteString("\n\n" + notesHeadSt.Render("更新说明") + "\n")
+	b.WriteString(notesBodySt.Render(strings.Join(shown, "\n")))
+	if len(lines) > updateNotesCollapsed {
+		b.WriteString("\n" + notesToggleSt.Render(" "+m.notesToggleLabel(len(lines))+" "))
+	}
+	if clipped {
+		b.WriteString("\n" + notesHintSt.Render("终端高度有限，完整说明见发布页"))
+	}
+	return b.String()
+}
+
+// toggleUpdateNotes flips the notes between collapsed and expanded and
+// rebuilds the dialog body, which renderModal reads.
+func (m model) toggleUpdateNotes() model {
+	if m.updateRes == nil || len(updateNotesLines(m.updateRes.Notes)) <= updateNotesCollapsed {
+		return m
+	}
+	m.notesExpanded = !m.notesExpanded
+	m.modalBody = m.updateConfirmBody()
+	return m
+}
+
+// notesToggleHit reports whether (x, y) lands on the expand/collapse button.
+func (m model) notesToggleHit(x, y int) bool {
+	if m.modalKind != "confirm" || m.confirmAction != "update_available" || m.updateRes == nil {
+		return false
+	}
+	lines := updateNotesLines(m.updateRes.Notes)
+	if len(lines) <= updateNotesCollapsed {
+		return false
+	}
+	label := m.notesToggleLabel(len(lines))
+	ox, oy, _, _ := m.overlayOrigin()
+	for i, line := range strings.Split(m.renderModal(), "\n") {
+		plain := xansi.Strip(line)
+		j := strings.Index(plain, label)
+		if j < 0 {
+			continue
+		}
+		rowY := oy + i
+		if y < rowY-1 || y > rowY+1 {
+			continue
+		}
+		// one cell of slack each side for the padding spaces
+		x0 := ox + xansi.StringWidth(plain[:j]) - 1
+		x1 := x0 + xansi.StringWidth(label) + 2
+		return x >= x0 && x <= x1
+	}
+	return false
+}
+
 func (m model) renderModal() string {
 	switch m.modalKind {
 	case "confirm":
@@ -2570,6 +2731,10 @@ func (m model) renderModal() string {
 		hint := "←/→ 切换 · Enter 当前高亮 · Esc 默认按钮 · 可点击"
 		if m.confirmAction == "conflict_replace" {
 			hint = "←/→ 切换 · Enter 当前高亮 · Esc 替换 · 可点击"
+		}
+		if m.confirmAction == "update_available" && m.updateRes != nil &&
+			len(updateNotesLines(m.updateRes.Notes)) > updateNotesCollapsed {
+			hint = "←/→ 切换 · d 展开/收起说明 · Enter 确认 · 可点击"
 		}
 		// Footer must set BOTH fg+bg: nesting helpStyle inside confirmBox.Render
 		// drops dim color on some terminals and "可点击" falls back to bright white.
@@ -2938,7 +3103,6 @@ func truncateCells(s string, n int) string {
 	}
 	return b.String() + "…"
 }
-
 
 func formatProfile(info map[string]any, cfg *config.Config, version string) string {
 	nick := strAny(info["nickname"])

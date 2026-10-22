@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -16,7 +17,9 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
+	"unicode"
 )
 
 const (
@@ -52,11 +55,22 @@ type Result struct {
 	// digest of the binary that was actually installed.
 	SumsURL string `json:"sums_url,omitempty"`
 	SHA256  string `json:"sha256,omitempty"`
+
+	// Notes is the release body, sanitized for display on a terminal. It is
+	// remote, attacker-influenced text: never print it without going through
+	// sanitizeNotes first.
+	Notes string `json:"notes,omitempty"`
+
+	// PendingCleanup is the replaced binary that could not be deleted yet —
+	// Windows holds the image of a running process open. CleanupLeftovers
+	// removes it on the next start.
+	PendingCleanup string `json:"pending_cleanup,omitempty"`
 }
 
 type ghRelease struct {
 	TagName string `json:"tag_name"`
 	HTMLURL string `json:"html_url"`
+	Body    string `json:"body"`
 	Assets  []struct {
 		Name               string `json:"name"`
 		BrowserDownloadURL string `json:"browser_download_url"`
@@ -72,6 +86,40 @@ var repoPattern = regexp.MustCompile(`^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$`)
 // ValidRepo reports whether r is a safe "owner/name" repository reference.
 func ValidRepo(r string) bool {
 	return repoPattern.MatchString(r) && !strings.Contains(r, "..")
+}
+
+// MaxNotesBytes caps how much release prose is kept.
+const MaxNotesBytes = 16 << 10
+
+// ansiEscape matches ANSI escape sequences, including the CSI forms used for
+// colour and cursor movement.
+var ansiEscape = regexp.MustCompile("\x1b\\[[0-9;?]*[ -/]*[@-~]|\x1b[@-Z\\\\-_]|\x1b.")
+
+// sanitizeNotes makes a GitHub release body safe to print on a terminal. The
+// body is whatever the release author wrote, so it is treated as untrusted:
+// escape sequences could otherwise move the cursor, repaint the screen or
+// hide text, and an oversized body could bury the dialog around it.
+func sanitizeNotes(s string) string {
+	s = strings.ReplaceAll(s, "\r\n", "\n")
+	s = strings.ReplaceAll(s, "\r", "\n")
+	s = ansiEscape.ReplaceAllString(s, "")
+
+	var b strings.Builder
+	b.Grow(len(s))
+	for _, r := range s {
+		if r == '\n' || r == '\t' || !unicode.IsControl(r) {
+			b.WriteRune(r)
+		}
+	}
+	out := strings.TrimSpace(b.String())
+	if len(out) > MaxNotesBytes {
+		out = out[:MaxNotesBytes]
+		if i := strings.LastIndexByte(out, '\n'); i > 0 {
+			out = out[:i]
+		}
+		out = strings.TrimSpace(out) + "\n…"
+	}
+	return out
 }
 
 // NormalizeVersion strips leading "v" and spaces.
@@ -161,6 +209,7 @@ func Check(ctx context.Context, current, repo string) (*Result, error) {
 		ReleaseURL: rel.HTMLURL,
 		Repo:       repo,
 		CustomRepo: repo != DefaultRepo,
+		Notes:      sanitizeNotes(rel.Body),
 	}
 	if Compare(cur, latest) >= 0 {
 		res.UpdateAvailable = false
@@ -351,6 +400,13 @@ func ApplyWithOptions(ctx context.Context, res *Result, opt ApplyOptions) error 
 		return fmt.Errorf("no %s for release %s; refusing to self-update unverified", SumsAssetName, res.Latest)
 	}
 
+	// Claim the in-process slot before any network work, so a duplicate
+	// goroutine stops here rather than downloading the release a second time.
+	if !applyInFlight.CompareAndSwap(false, true) {
+		return fmt.Errorf("%w: this process is already updating", ErrUpdateInProgress)
+	}
+	defer applyInFlight.Store(false)
+
 	// Fetch the expected digest first — no point downloading if the manifest
 	// does not cover our asset.
 	wantSum, err := fetchExpectedSum(ctx, res.SumsURL, res.AssetName)
@@ -368,14 +424,39 @@ func ApplyWithOptions(ctx context.Context, res *Result, opt ApplyOptions) error 
 	}
 	res.BinaryPath = exe
 
-	tmp := exe + ".new"
+	dir := filepath.Dir(exe)
+
+	// One updater at a time. Two concurrent Apply calls — the TUI and the MCP
+	// server, say — both staged to the same exe+".new" path: whichever renamed
+	// it into place first left the other chmod'ing a file that was no longer
+	// there, which surfaced as "chmod ...goquark.new: no such file or
+	// directory" even though the update had in fact succeeded.
+	unlock, err := lockUpdate(dir)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+
+	// Stage under a unique name beside the target, so the install is a rename
+	// within one filesystem and no two runs can collide on the same path.
+	stage, err := os.CreateTemp(dir, stagePrefix+"*")
+	if err != nil {
+		return fmt.Errorf("stage the download in %s: %w", dir, err)
+	}
+	tmp := stage.Name()
+	_ = stage.Close()
+	installed := false
+	defer func() {
+		if !installed {
+			_ = os.Remove(tmp)
+		}
+	}()
+
 	gotSum, err := downloadFile(ctx, res.AssetURL, tmp)
 	if err != nil {
-		_ = os.Remove(tmp)
 		return err
 	}
 	if !strings.EqualFold(gotSum, wantSum) {
-		_ = os.Remove(tmp)
 		return fmt.Errorf(
 			"checksum mismatch for %s: %s lists %s, download is %s — update aborted",
 			res.AssetName, SumsAssetName, wantSum, gotSum,
@@ -384,28 +465,151 @@ func ApplyWithOptions(ctx context.Context, res *Result, opt ApplyOptions) error 
 	res.SHA256 = gotSum
 
 	if err := os.Chmod(tmp, 0o755); err != nil {
-		_ = os.Remove(tmp)
+		return fmt.Errorf("make the staged binary executable: %w", err)
+	}
+
+	pending, err := swapBinary(tmp, exe)
+	if err != nil {
 		return err
 	}
-	// replace: try rename over; on Windows may need remove first
-	bak := exe + ".bak"
-	_ = os.Remove(bak)
-	if err := os.Rename(exe, bak); err != nil {
-		// if can't move running binary, try direct overwrite on unix via rename new→exe after unlink
-		if err2 := os.Remove(exe); err2 != nil {
-			_ = os.Remove(tmp)
-			return fmt.Errorf("replace binary: %v (backup: %v)", err2, err)
-		}
-	}
-	if err := os.Rename(tmp, exe); err != nil {
-		// restore bak
-		_ = os.Rename(bak, exe)
-		_ = os.Remove(tmp)
-		return fmt.Errorf("install new binary: %w", err)
-	}
-	_ = os.Remove(bak) // best-effort; linux allows deleting running bak
+	installed = true
 	res.Applied = true
+	res.PendingCleanup = pending
 	return nil
+}
+
+// removeFile and renameFile are os.Remove and os.Rename, replaced in tests so
+// the platform-specific failures this function exists to handle — Windows
+// refusing to delete the image of a running process, an install that cannot
+// be moved into place — can be exercised anywhere.
+var (
+	removeFile = os.Remove
+	renameFile = os.Rename
+)
+
+// swapBinary installs the staged binary at exe, moving the current one aside
+// first.
+//
+// Windows refuses to delete or write over the image of a running process, but
+// it does allow renaming it — so the old binary is moved out of the way and
+// the new one takes its place. The running binary is never unlinked: if the
+// install then failed, the user would be left with nothing to run at all.
+//
+// The returned path is the old image when it could not be deleted. On Windows
+// that is the normal outcome rather than a failure, and CleanupLeftovers
+// removes it the next time GoQuark starts.
+func swapBinary(tmp, exe string) (pending string, err error) {
+	bak := exe + bakSuffix
+	_ = removeFile(bak)
+	if err := renameFile(exe, bak); err != nil {
+		return "", fmt.Errorf("move the running binary aside (%s): %w", exe, err)
+	}
+	if err := renameFile(tmp, exe); err != nil {
+		_ = renameFile(bak, exe) // put ourselves back
+		return "", fmt.Errorf("install the new binary at %s: %w", exe, err)
+	}
+	if err := removeFile(bak); err != nil {
+		return bak, nil
+	}
+	return "", nil
+}
+
+// ErrUpdateInProgress reports that an update is already running: another
+// goroutine in this process, or another GoQuark process on this machine.
+// Callers can treat it as "wait and retry" rather than as a failure.
+var ErrUpdateInProgress = errors.New("an update is already in progress")
+
+// applyInFlight guards an apply within this process.
+//
+// The on-disk lock below covers other processes, but it is the wrong tool for
+// our own goroutines: two of them would serialise on it only by one failing,
+// and a goroutine arriving just as the first released the lock would download
+// and install the whole release a second time. A process-local claim, taken
+// before any network work, keeps that to one attempt.
+var applyInFlight atomic.Bool
+
+const (
+	stagePrefix = ".goquark-update-"
+	bakSuffix   = ".bak"
+	lockName    = ".goquark-update.lock"
+	// lockStale is how long a lock file may sit before it is treated as
+	// abandoned by a crashed updater rather than held by a live one.
+	lockStale = 15 * time.Minute
+)
+
+// lockUpdate takes a best-effort exclusive lock on updates in dir, so two
+// processes cannot stage and swap the binary at the same time. The returned
+// function releases it.
+func lockUpdate(dir string) (func(), error) {
+	path := filepath.Join(dir, lockName)
+	for attempt := 0; attempt < 2; attempt++ {
+		f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+		if err == nil {
+			fmt.Fprintf(f, "%d\n", os.Getpid())
+			_ = f.Close()
+			return func() { _ = os.Remove(path) }, nil
+		}
+		if !os.IsExist(err) {
+			return nil, fmt.Errorf("lock updates in %s: %w", dir, err)
+		}
+		st, statErr := os.Stat(path)
+		if statErr != nil || time.Since(st.ModTime()) < lockStale {
+			return nil, fmt.Errorf(
+				"%w: another GoQuark process holds %s; try again once it has finished",
+				ErrUpdateInProgress, path,
+			)
+		}
+		_ = os.Remove(path) // abandoned by an updater that died mid-run
+	}
+	return nil, fmt.Errorf("%w: lock %s could not be claimed", ErrUpdateInProgress, path)
+}
+
+// CleanupLeftovers removes what a previous update could not. On Windows the
+// replaced image cannot be deleted while the old process still runs it, and a
+// run that died mid-download leaves a staged file behind. Safe to call on
+// every start: it never touches the current executable, and it leaves recent
+// staging files alone in case an update is in flight.
+func CleanupLeftovers() {
+	exe, err := os.Executable()
+	if err != nil {
+		return
+	}
+	if resolved, err := filepath.EvalSymlinks(exe); err == nil {
+		exe = resolved
+	}
+	dir := filepath.Dir(exe)
+
+	// Another GoQuark may be mid-update right now, in which case the backup it
+	// just moved aside is the only copy it can roll back to. Leave everything
+	// alone until that run has finished — ours included, since the on-disk
+	// lock only appears partway into an apply.
+	if applyInFlight.Load() {
+		return
+	}
+	if st, err := os.Stat(filepath.Join(dir, lockName)); err == nil {
+		if time.Since(st.ModTime()) < lockStale {
+			return
+		}
+		_ = os.Remove(filepath.Join(dir, lockName))
+	}
+
+	_ = os.Remove(exe + bakSuffix)
+	_ = os.Remove(exe + ".new") // staging path used up to v1.0.4
+
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		if !strings.HasPrefix(e.Name(), stagePrefix) {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil || time.Since(info.ModTime()) < time.Hour {
+			continue
+		}
+		_ = os.Remove(filepath.Join(dir, e.Name()))
+	}
 }
 
 // fetchExpectedSum reads the SHA256SUMS manifest and returns the digest listed
