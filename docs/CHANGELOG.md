@@ -11,6 +11,29 @@ Versioning follows the root [`VERSION`](../VERSION) file (semver).
 
 ### Changed
 
+## [1.0.4] — 2026-10-22
+
+### Security
+- Dependency `refraction-networking/utls` 1.6.7 → 1.8.2: ServerHellos were
+  accepted without checking the TLS 1.3 downgrade canaries
+  (GHSA-pmc3-p9hx-jq96), and the Chrome parrots were detectable through a
+  missing padding extension (CVE-2026-26995) and a GREASE ECH mismatch
+  (CVE-2026-27017) — every HTTPS request GoQuark makes handshakes through uTLS
+- Dependency `klauspost/compress` 1.17.4 → 1.20.3: out-of-bounds read in the
+  s2 decoder (GHSA-259r-337f-4rfw)
+- Dependencies `golang.org/x/crypto` 0.30.0 → 0.58.0 and `golang.org/x/sys`
+  0.28.0 → 0.49.0: clears CVE-2024-45337 and some twenty further advisories.
+  All of them sit in `ssh`, `ssh/agent`, `knownhosts` and `openpgp`, which
+  GoQuark never imports, so none was reachable — the bump keeps dependency
+  scanners quiet rather than closing a live hole
+
+### Changed
+- Dependencies `golang.org/x/text` 0.21.0 → 0.43.0 and `golang.org/x/sync`
+  0.10.0 → 0.24.0; `cloudflare/circl` is gone, uTLS 1.8 no longer needs it
+- `go.mod` Go directive 1.23 → 1.26.0, as the upgraded modules require.
+  `GOTOOLCHAIN=auto` (the default) fetches a matching toolchain on demand, so
+  only `GOTOOLCHAIN=local` builders need to upgrade Go themselves
+
 ## [1.0.3] — 2026-08-31
 
 ### Security

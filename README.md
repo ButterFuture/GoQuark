@@ -15,8 +15,8 @@
 </p>
 
 <p align="center">
-  <img alt="version" src="https://img.shields.io/badge/version-1.0.3-blue">
-  <img alt="go" src="https://img.shields.io/badge/Go-1.22+-00ADD8?logo=go">
+  <img alt="version" src="https://img.shields.io/badge/version-1.0.4-blue">
+  <img alt="go" src="https://img.shields.io/badge/Go-1.26+-00ADD8?logo=go">
   <img alt="license" src="https://img.shields.io/badge/license-AGPL--3.0-blue">
   <img alt="platform" src="https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-lightgrey">
 </p>
@@ -96,7 +96,7 @@ curl -fsSL https://raw.githubusercontent.com/ButterFuture/GoQuark/main/scripts/i
 
 ```bash
 # 指定版本 / 目录
-curl -fsSL https://raw.githubusercontent.com/ButterFuture/GoQuark/main/scripts/install.sh | bash -s -- --version v1.0.3
+curl -fsSL https://raw.githubusercontent.com/ButterFuture/GoQuark/main/scripts/install.sh | bash -s -- --version v1.0.4
 curl -fsSL https://raw.githubusercontent.com/ButterFuture/GoQuark/main/scripts/install.sh | bash -s -- --dir ~/.local/bin
 ```
 
@@ -112,8 +112,8 @@ curl -fsSL https://raw.githubusercontent.com/ButterFuture/GoQuark/main/scripts/i
 4. `chmod +x goquark_*` 后移到 `PATH` 中，并重命名为 `goquark`
 
 ```bash
-chmod +x goquark_1.0.3_linux_amd64
-sudo mv goquark_1.0.3_linux_amd64 /usr/local/bin/goquark
+chmod +x goquark_1.0.4_linux_amd64
+sudo mv goquark_1.0.4_linux_amd64 /usr/local/bin/goquark
 ```
 
 安装完成后，**推荐直接启动 TUI**：
@@ -246,7 +246,7 @@ goquark version
 
 | 项目 | 说明 |
 |------|------|
-| 唯一来源 | 仓库根目录 [`VERSION`](VERSION)（当前 **1.0.3**） |
+| 唯一来源 | 仓库根目录 [`VERSION`](VERSION)（当前 **1.0.4**） |
 | 构建注入 | `scripts/build.sh` / CI 通过 `-ldflags` 写入二进制 |
 | 本地 `go run` | 未注入时显示 `dev` |
 
@@ -256,7 +256,7 @@ goquark version
 goquark version        # 查看已注入版本
 ```
 
-发版建议：改功能 → 确认 → 更新 `VERSION` → 打 tag `v1.0.3` → CI / Release。
+发版建议：改功能 → 确认 → 更新 `VERSION` → 打 tag `v1.0.4` → CI / Release。
 
 ---
 
@@ -331,7 +331,7 @@ Copyright (c) 2026 ButterFuture
 
 ## 状态
 
-**v1.0.3** — 安全加固：自更新校验和验证、更新来源锁定、文件名与登录二维码加固；在 v1.0.2 能力之上。
+**v1.0.4** — 依赖安全更新：uTLS 补回 TLS 1.3 降级校验、修掉两处 Chrome 指纹缺陷，压缩库越界读修复；在 v1.0.3 能力之上。
 
 后续计划：公开仓正式发版通道、应用内检查更新（可选）、更丰富的 MCP 能力。
 
