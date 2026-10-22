@@ -89,11 +89,9 @@ jobs:
           ls -lh "$OUT"
 
       # Only the release job consumes these, and it runs on v* tags only.
-      # This repo is private, so every upload counts against the account's
-      # Actions storage quota: uploading on ordinary main pushes filled it with
-      # ~544 MB of binaries nothing ever downloaded, and later runs then failed
-      # with "Artifact storage quota has been hit". Releases are cut from the
-      # public repo, so in practice this step never runs here.
+      # Uploading on ordinary main pushes fills the account's Actions storage
+      # quota with binaries nothing ever downloads, until later runs start
+      # failing with "Artifact storage quota has been hit".
       - name: Upload artifact
         if: startsWith(github.ref, 'refs/tags/v')
         uses: actions/upload-artifact@v4
