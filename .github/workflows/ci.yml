@@ -121,10 +121,34 @@ jobs:
           sha256sum * > SHA256SUMS
           cat SHA256SUMS
 
+      # Give the Release page the CHANGELOG section for this version, so it
+      # says what changed instead of only linking a compare view. This matters
+      # most for security releases, where "should I upgrade?" has a real
+      # answer. generate_release_notes still appends the commit list below it.
+      - name: Release notes from CHANGELOG
+        run: |
+          VERSION="$(tr -d '[:space:]' < VERSION | sed 's/^v//')"
+          awk -v v="$VERSION" '
+            index($0, "## [" v "]") == 1 { inside = 1; next }
+            inside && index($0, "## [") == 1 { exit }
+            inside { print }
+          ' docs/CHANGELOG.md > notes.tmp
+          # drop leading and trailing blank lines
+          sed '/./,$!d' notes.tmp | awk 'NF {last = NR} {line[NR] = $0} END {for (i = 1; i <= last; i++) print line[i]}' \
+            > RELEASE_NOTES.md
+          rm -f notes.tmp
+          if [ ! -s RELEASE_NOTES.md ]; then
+            echo "docs/CHANGELOG.md has no section for $VERSION — add one before tagging" >&2
+            exit 1
+          fi
+          echo "--- release body ---"
+          cat RELEASE_NOTES.md
+
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           files: artifacts/*
+          body_path: RELEASE_NOTES.md
           generate_release_notes: true
           draft: false
         env:
