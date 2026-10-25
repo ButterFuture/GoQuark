@@ -11,6 +11,43 @@ Versioning follows the root [`VERSION`](../VERSION) file (semver).
 
 ### Changed
 
+## [1.0.6] — 2026-10-25
+
+### Added
+- TUI downloads accept folders. Files and folders can be picked together and
+  are fetched recursively, keeping the selected folder's own name, every
+  subdirectory and the empty ones. Each path component is sanitised on its
+  own, so a name the drive sends cannot climb out of the download directory,
+  and a destination held by a running job, or occupied by anything that is
+  not a plain file, is refused rather than written through. Two names that
+  differ only in case or in Unicode composition count as one destination,
+  because macOS and Windows both resolve them to a single file. At most 3
+  files download at once and the rest queue; a link is fetched only once its
+  job starts, so links no longer expire while a long queue drains. Scanning
+  runs in the background and is dropped on quit or logout. The gap was
+  pointed out by a fork from @WenchaoZeng; the implementation here is ours
+- The update progress dialog has a 取消更新 button, and Esc aborts too. Nothing
+  is installed until the download has been verified, so cancelling during it
+  leaves the running version untouched. Once the update is in, the dialog has
+  no cancel button left to press
+
+### Fixed
+- The part map of a multi-part download was read by the job dispatcher and
+  by the periodic flush while the workers were writing it. Ranging over a
+  map that is being written to is a hard runtime fault, not a stale read.
+  Every access now goes through a mutex, and the flush encodes inside it
+  rather than from a copy
+- The part dispatcher could stay parked for the life of the process once
+  every worker had given up on an error, with nothing left to drain the
+  queue it was waiting on
+- Clicking 立即更新 made the progress dialog flash and disappear, leaving the
+  download running with nothing on screen. A mouse click is a press and then
+  a release: the press started the update and swapped in the progress dialog,
+  and the release was read by that new dialog as "click anywhere to dismiss".
+  The release that belongs to a press already acted on is now dropped, which
+  also stops a single click from activating two dialogs in a row
+- A stray click no longer dismisses the update progress dialog either
+
 ## [1.0.5] — 2026-10-22
 
 ### Added

@@ -169,6 +169,14 @@ type model struct {
 	// notesExpanded toggles the release notes in the update dialog between a
 	// few lines and the full text.
 	notesExpanded bool
+
+	// swallowRelease drops the mouse release that follows a press we already
+	// acted on. A click is press+release; without this the release is handed
+	// to whatever the press turned the screen into.
+	swallowRelease bool
+
+	// updateCancel aborts the download behind the progress dialog.
+	updateCancel context.CancelFunc
 	// last rendered overlay geometry (for mouse hit testing)
 	ovX, ovY, ovW, ovH int
 	// confirm button rows/cols relative to overlay top-left (screen coords filled after render)
@@ -183,6 +191,14 @@ type model struct {
 	dlBusy bool
 	dlMsg  string
 	dlMgr  *download.Manager
+	// scan is the folder expansion running behind the browse view. gen rises
+	// with every new scan, so a result that arrives from one already cancelled
+	// can be told apart and dropped.
+	scan struct {
+		busy   bool
+		gen    uint64
+		cancel context.CancelFunc
+	}
 	// downloads center cursor
 	dlCursor int
 	// startup resume prompt
@@ -242,6 +258,9 @@ type dlJob struct {
 	replace              bool // delete existing dest before download
 }
 type dlEnqueueMsg struct {
+	// scanGen identifies the expansion this result came from; zero means it was
+	// not produced by one.
+	scanGen uint64
 	jobs    []dlJob
 	focusID string // jump/highlight existing task
 	status  string
@@ -357,12 +376,11 @@ func (m model) cmdCheckUpdate(manual bool) tea.Cmd {
 	}
 }
 
-func (m model) cmdApplyUpdate(res *update.Result) tea.Cmd {
+// cmdApplyUpdate runs the update under a context the dialog can cancel, so
+// the goroutine is not left downloading after the user has backed out.
+func cmdApplyUpdate(ctx context.Context, res *update.Result) tea.Cmd {
 	return func() tea.Msg {
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
-		defer cancel()
-		err := update.Apply(ctx, res)
-		return updateApplyMsg{res: res, err: err}
+		return updateApplyMsg{res: res, err: update.Apply(ctx, res)}
 	}
 }
 
@@ -595,6 +613,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, tickDownloads()
 
 	case dlEnqueueMsg:
+		if msg.scanGen != 0 {
+			// A scan cancelled by quit or logout may still deliver; its result
+			// describes a session that is gone.
+			if !m.scan.busy || msg.scanGen != m.scan.gen || m.quitting {
+				return m, nil
+			}
+			m.stopScan()
+		}
 		if msg.err != nil {
 			if client.IsAuthError(msg.err) {
 				m.cfg.ClearSession()
@@ -623,6 +649,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		var lastID string
 		for _, j := range msg.jobs {
 			if j.replace {
+				if m.dlMgr.BusyAtDest(j.dest) != nil {
+					return m.showModal("下载失败", "目标路径已有下载任务："+j.dest, "error", modeDownloads), nil
+				}
 				_ = os.Remove(j.dest)
 				_ = os.Remove(j.dest + ".gqparts")
 			}
@@ -706,7 +735,21 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case updateApplyMsg:
 		m.loading = false
+		if m.updateCancel != nil {
+			m.updateCancel()
+			m.updateCancel = nil
+		}
 		if msg.err != nil {
+			if errors.Is(msg.err, context.Canceled) {
+				// Nothing is installed until the download has been verified,
+				// so backing out during it leaves the binary untouched.
+				return m.showModal("已取消更新",
+					"下载已中止，当前版本没有任何改动。", "info", modeBrowse), nil
+			}
+			if errors.Is(msg.err, context.DeadlineExceeded) {
+				return m.showModal("更新超时",
+					"下载超时已中止，当前版本没有任何改动。", "error", modeBrowse), nil
+			}
 			if errors.Is(msg.err, update.ErrUpdateInProgress) {
 				// A second trigger, not a failure — the first one is still
 				// downloading and will report on its own.
@@ -780,6 +823,37 @@ func (m model) showModal(title, body, kind string, back mode) model {
 	m.btnHover = 0
 	m.mode = modeModal
 	return m
+}
+
+// progressCancelLabel is both the button text and what progressCancelHit
+// looks for in the rendered modal, so the two cannot drift apart.
+const progressCancelLabel = "取消更新"
+
+// showProgress puts up a dialog that stays until the work behind it reports
+// back. Unlike an info modal it is not dismissed by a stray click — the
+// release half of the very click that opened it used to do exactly that —
+// and it carries the one action that makes sense while work is running.
+func (m model) showProgress(title, body string) model {
+	m.modalTitle = title
+	m.modalBody = body
+	m.modalKind = "progress"
+	m.modalBack = modeBrowse
+	m.confirmAction = ""
+	m.btnFocus = 0
+	m.btnHover = 0
+	m.mode = modeModal
+	return m
+}
+
+// cancelUpdate aborts the download. The apply goroutine notices the cancelled
+// context, clears its staging file and reports back, so the dialog is
+// replaced from updateApplyMsg rather than here.
+func (m model) cancelUpdate() (tea.Model, tea.Cmd) {
+	if m.updateCancel != nil {
+		m.updateCancel()
+	}
+	m.modalBody = "正在中止…"
+	return m, nil
 }
 
 func (m model) showConfirm(title, body, action string) model {
@@ -915,9 +989,41 @@ func (m model) activateConfirmBtn(which int) (tea.Model, tea.Cmd) {
 }
 
 func (m model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
+	// A click arrives as a press and then a release. When the press already
+	// acted, the release must not be handed to whatever the screen has become
+	// in the meantime: pressing 立即更新 swapped the dialog for the progress
+	// one, and the release was then read by that dialog as "click anywhere to
+	// dismiss", so it vanished in the frame it appeared.
+	switch msg.Action {
+	case tea.MouseActionRelease:
+		if m.swallowRelease {
+			m.swallowRelease = false
+			return m, nil
+		}
+	case tea.MouseActionPress:
+		m.swallowRelease = false
+	}
+
 	// modal: clickable buttons for confirm; hover highlights
 	if m.mode == modeModal {
 		if m.quitting {
+			return m, nil
+		}
+		if m.modalKind == "progress" {
+			if msg.Action == tea.MouseActionMotion {
+				m.btnHover = 0
+				if m.progressCancelHit(msg.X, msg.Y) {
+					m.btnHover = 2
+				}
+				return m, nil
+			}
+			if msg.Button == tea.MouseButtonLeft &&
+				(msg.Action == tea.MouseActionPress || msg.Action == tea.MouseActionRelease) &&
+				m.progressCancelHit(msg.X, msg.Y) {
+				m.swallowRelease = msg.Action == tea.MouseActionPress
+				return m.cancelUpdate()
+			}
+			// Anything else leaves the download running and the dialog up.
 			return m, nil
 		}
 		if m.modalKind == "confirm" {
@@ -944,9 +1050,11 @@ func (m model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 					return m, nil
 				}
 				if m.hitOK(msg.X, msg.Y) {
+					m.swallowRelease = msg.Action == tea.MouseActionPress
 					return m.activateConfirmBtn(1)
 				}
 				if m.hitCancel(msg.X, msg.Y) {
+					m.swallowRelease = msg.Action == tea.MouseActionPress
 					return m.activateConfirmBtn(2)
 				}
 				// outside click = secondary only on release (avoid accidental)
@@ -1135,6 +1243,17 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case modeModal:
 		// while quitting, ignore keys/clicks
 		if m.quitting {
+			return m, nil
+		}
+		if m.modalKind == "progress" {
+			// Only an explicit abort does anything; a stray Enter must not
+			// throw away a download that is half done.
+			switch key {
+			case "ctrl+c":
+				return m, tea.Quit
+			case "esc":
+				return m.cancelUpdate()
+			}
 			return m, nil
 		}
 		switch key {
@@ -1645,13 +1764,12 @@ func (m model) runConfirmed(action string) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		if res.CanApply {
-			m.mode = modeModal
-			m.modalKind = "info"
-			m.modalTitle = "正在更新"
-			m.modalBody = m.spinner.View() + " 正在下载 " + res.AssetName + " …"
-			m.confirmAction = ""
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+			m.updateCancel = cancel
+			m = m.showProgress("正在更新",
+				m.spinner.View()+" 正在下载 "+res.AssetName+" …")
 			m.loading = true
-			return m, tea.Batch(m.spinner.Tick, m.cmdApplyUpdate(res))
+			return m, tea.Batch(m.spinner.Tick, cmdApplyUpdate(ctx, res))
 		}
 		// cannot apply — primary was "知道了"
 		m.mode = modeBrowse
@@ -1696,6 +1814,9 @@ func (m model) resolveConflict(replace bool) (tea.Model, tea.Cmd) {
 	m.conflictQ = m.conflictQ[1:]
 	dest := c.dest
 	if replace {
+		if m.dlMgr != nil && m.dlMgr.BusyAtDest(dest) != nil {
+			return m.showModal("下载失败", "目标路径已有下载任务："+dest, "error", modeDownloads), nil
+		}
 		_ = os.Remove(dest)
 		_ = os.Remove(dest + ".gqparts")
 	} else {
@@ -1728,6 +1849,7 @@ func (m model) resolveConflict(replace bool) (tea.Model, tea.Cmd) {
 // beginQuit pauses active downloads then quits.
 // Wait runs in a tea.Cmd (background), TUI keeps spinning until done.
 func (m model) beginQuit() (tea.Model, tea.Cmd) {
+	m.stopScan()
 	if m.dlMgr == nil || m.dlMgr.ActiveCount() == 0 {
 		return m, tea.Quit
 	}
@@ -1771,6 +1893,7 @@ func (m model) fetchProfile() tea.Cmd {
 }
 
 func (m model) doLogout() (tea.Model, tea.Cmd) {
+	m.stopScan()
 	m.cfg.ClearSession()
 	_ = m.cfg.Save()
 	m.mode = modeLogin
@@ -1800,8 +1923,8 @@ func (m model) doActivate() (tea.Model, tea.Cmd) {
 	if len(m.rows) == 0 {
 		return m, nil
 	}
-	// if multi-selected files only → download all
-	if n := m.selectedFileCount(); n > 1 {
+	// more than one thing ticked → download them all, folders included
+	if n := m.selectedCount(); n > 1 {
 		return m.doDownload()
 	}
 	it := m.rows[m.cursor]
@@ -1818,45 +1941,66 @@ func (m model) doActivate() (tea.Model, tea.Cmd) {
 	return m.doDownload()
 }
 
-func (m model) selectedFileCount() int {
+// selectedCount counts the ticked rows that can be downloaded, folders
+// included. The parent row is never one of them.
+func (m model) selectedCount() int {
 	n := 0
 	for i, on := range m.selected {
 		if !on || i < 0 || i >= len(m.rows) {
 			continue
 		}
-		r := m.rows[i]
-		if !r.entry.Dir && r.entry.Name != ".." {
+		if m.rows[i].entry.Name != ".." {
 			n++
 		}
 	}
 	return n
 }
 
-func (m model) selectedFiles() []row {
-	// if multi selection has files, use them; else cursor file
-	var out []row
+// selectedEntries returns what the user picked: the ticked rows, or the row
+// under the cursor when nothing is ticked. Folders are included — expanding
+// them is the download planner's job, not this function's.
+func (m model) selectedEntries() []api.FileEntry {
+	var out []api.FileEntry
 	for i, on := range m.selected {
 		if !on || i < 0 || i >= len(m.rows) {
 			continue
 		}
-		r := m.rows[i]
-		if !r.entry.Dir && r.entry.Name != ".." {
-			out = append(out, r)
+		if r := m.rows[i]; r.entry.Name != ".." {
+			out = append(out, r.entry)
 		}
 	}
-	if len(out) == 0 && len(m.rows) > 0 {
-		r := m.rows[m.cursor]
-		if !r.entry.Dir && r.entry.Name != ".." {
-			out = append(out, r)
+	if len(out) > 0 {
+		return out
+	}
+	if m.cursor >= 0 && m.cursor < len(m.rows) {
+		if r := m.rows[m.cursor]; r.entry.Name != ".." {
+			out = append(out, r.entry)
 		}
 	}
 	return out
 }
 
+// stopScan cancels a running folder expansion and makes any result still in
+// flight stale.
+func (m *model) stopScan() {
+	if m.scan.cancel != nil {
+		m.scan.cancel()
+	}
+	m.scan.busy = false
+	m.scan.cancel = nil
+}
+
+// doDownload expands the selection off the UI goroutine — a folder costs one
+// directory listing per page, per level — and brings the result back as a
+// dlEnqueueMsg.
 func (m model) doDownload() (tea.Model, tea.Cmd) {
-	files := m.selectedFiles()
-	if len(files) == 0 {
-		m.status = "请选择文件再下载"
+	if m.scan.busy {
+		return m, nil
+	}
+	sel := m.selectedEntries()
+	if len(sel) == 0 {
+		m.status = "请选择文件或文件夹再下载"
+		m.dlMsg = m.status
 		return m, nil
 	}
 	// always refresh dest dir from config (user may have changed download_dir)
@@ -1865,114 +2009,172 @@ func (m model) doDownload() (tea.Model, tea.Cmd) {
 		m.dlMgr = download.Global()
 		m.dlMgr.BindClient(m.client)
 	}
-	m.dlMgr.SetDestDir(destDir)
 	cl := m.client
+	// Jobs carry a FID and no link, so the manager needs to be able to fetch
+	// one when a job reaches the front of the queue.
+	m.dlMgr.ResolveURL = func(fid string) (string, int64, error) {
+		return api.GetDownloadURL(cl, fid)
+	}
+	m.dlMgr.SetDestDir(destDir)
 	mgr := m.dlMgr
+	ctx, cancel := context.WithCancel(context.Background())
+	m.scan.busy = true
+	m.scan.gen++
+	m.scan.cancel = cancel
+	gen := m.scan.gen
 	return m, func() tea.Msg {
-		_ = os.MkdirAll(destDir, 0o755)
-		// drop done records whose files are gone (before dedupe checks)
-		if n := mgr.ClearStaleDone(); n > 0 {
-			// silent cleanup; notes below if user re-downloads same file
-			_ = n
+		msg := planDownloads(ctx, cl, mgr, destDir, sel)
+		msg.scanGen = gen
+		return msg
+	}
+}
+
+// destUnavailable reports why dest cannot be written, or nil when it can.
+// Anything that is not a plain file is refused rather than opened: following a
+// symlink here would write wherever it points, and the name it was built from
+// came from the drive.
+func destUnavailable(mgr *download.Manager, dest, fid string) error {
+	if busy := mgr.BusyAtDest(dest); busy != nil && busy.FID != fid {
+		return fmt.Errorf("目标路径已有其他文件的下载任务：%s", dest)
+	}
+	info, err := os.Lstat(dest)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
 		}
-		var jobs []dlJob
-		var conflicts []dlConflict
-		var focusID string
-		var notes []string
-		for _, f := range files {
-			fid := f.entry.FID
-			name := f.entry.Name
-			dest := filepath.Join(destDir, sanitizeName(name))
+		return fmt.Errorf("检查目标文件 %s：%w", dest, err)
+	}
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("目标路径不是普通文件，拒绝写入：%s", dest)
+	}
+	return nil
+}
 
-			// Dedup only within the CURRENT download_dir.
-			// Changing download_dir allows a fresh download of the same FID.
-			if existing := mgr.FindByFIDInDir(fid, destDir); existing != nil {
-				// Done but local file missing → drop record and re-download
-				if existing.Status == download.StatusDone {
-					if _, err := os.Stat(existing.Dest); err != nil {
-						mgr.RemoveID(existing.ID)
-						// fall through to new download
-					} else if existing.Total > 0 && fileSize(existing.Dest) == existing.Total {
-						focusID = existing.ID
-						notes = append(notes, fmt.Sprintf("「%s」已经下载完成", name))
-						continue
-					} else if existing.Total > 0 && fileSize(existing.Dest) != existing.Total {
-						// local modified → replace/rename prompt
-						urlStr, _, uerr := api.GetDownloadURL(cl, fid)
-						if uerr != nil {
-							return dlEnqueueMsg{err: fmt.Errorf("%s: %w", name, uerr)}
-						}
-						conflicts = append(conflicts, dlConflict{
-							name: name, url: urlStr, dest: existing.Dest, fid: fid,
-							size: fileSize(existing.Dest),
-							reason: fmt.Sprintf("本地文件大小 %s 与网盘 %s 不一致（可能被修改）",
-								humanSize(fileSize(existing.Dest)), humanSize(existing.Total)),
-						})
-						continue
-					} else {
-						// total unknown but file exists
-						focusID = existing.ID
-						notes = append(notes, fmt.Sprintf("「%s」已经下载完成", name))
-						continue
+// planDownloads expands the selection and then decides, file by file, whether
+// to queue it, skip it, or put the choice to the user. It runs on a tea.Cmd
+// goroutine, so it touches no model state.
+func planDownloads(ctx context.Context, cl *client.Client, mgr *download.Manager, destDir string, sel []api.FileEntry) dlEnqueueMsg {
+	tree, err := download.Expand(ctx, sel, func(fid string, page, size int) ([]api.FileEntry, error) {
+		return api.ListDir(cl, fid, page, size)
+	})
+	if err != nil {
+		return dlEnqueueMsg{err: err}
+	}
+	// Folders are made now, not when the first file in them starts: an empty
+	// folder has no file to trigger it and would otherwise be lost.
+	if err := tree.MakeDirs(destDir); err != nil {
+		return dlEnqueueMsg{err: err}
+	}
+	// drop done records whose files are gone (before dedupe checks)
+	mgr.ClearStaleDone()
+
+	var jobs []dlJob
+	var conflicts []dlConflict
+	var focusID string
+	var notes []string
+	for _, item := range tree.Files() {
+		if err := ctx.Err(); err != nil {
+			return dlEnqueueMsg{err: err}
+		}
+		fid := item.Entry.FID
+		// Name is the path inside the download dir, so the download center can
+		// tell apart two same-named files from different folders.
+		name := item.Rel
+		dest := filepath.Join(destDir, item.Rel)
+
+		if err := destUnavailable(mgr, dest, fid); err != nil {
+			return dlEnqueueMsg{err: err}
+		}
+
+		// Dedup against this exact path. One cloud file can legitimately be
+		// wanted at two paths in one recursive download, so matching on the
+		// directory would drop all but the first.
+		if existing := mgr.FindAtDest(fid, dest); existing != nil {
+			// Done but local file missing → drop record and re-download
+			if existing.Status == download.StatusDone {
+				if _, err := os.Stat(existing.Dest); err != nil {
+					mgr.RemoveID(existing.ID)
+					// fall through to new download
+				} else if existing.Total > 0 && fileSize(existing.Dest) == existing.Total {
+					focusID = existing.ID
+					notes = append(notes, fmt.Sprintf("「%s」已经下载完成", name))
+					continue
+				} else if existing.Total > 0 && fileSize(existing.Dest) != existing.Total {
+					// local modified → replace/rename prompt
+					urlStr, _, uerr := api.GetDownloadURL(cl, fid)
+					if uerr != nil {
+						return dlEnqueueMsg{err: fmt.Errorf("%s: %w", name, uerr)}
 					}
+					conflicts = append(conflicts, dlConflict{
+						name: name, url: urlStr, dest: existing.Dest, fid: fid,
+						size: fileSize(existing.Dest),
+						reason: fmt.Sprintf("本地文件大小 %s 与网盘 %s 不一致（可能被修改）",
+							humanSize(fileSize(existing.Dest)), humanSize(existing.Total)),
+					})
+					continue
 				} else {
-					switch existing.Status {
-					case download.StatusRunning, download.StatusQueued, download.StatusFinalizing:
-						focusID = existing.ID
-						notes = append(notes, fmt.Sprintf("「%s」已在下载中", name))
-						continue
-					case download.StatusPaused, download.StatusError:
-						focusID = existing.ID
-						// resume this one only
-						if mgr.ResumeID(existing.ID) {
-							notes = append(notes, fmt.Sprintf("「%s」已恢复下载", name))
-						} else {
-							notes = append(notes, fmt.Sprintf("「%s」已在任务列表", name))
-						}
-						continue
-					case download.StatusCancel:
-						// remove cancel record and allow re-download
-						mgr.RemoveID(existing.ID)
-					}
-				}
-			}
-
-			// dest file exists without matching active task in this dir?
-			if fi, err := os.Stat(dest); err == nil {
-				urlStr, size, uerr := api.GetDownloadURL(cl, fid)
-				if uerr != nil {
-					return dlEnqueueMsg{err: fmt.Errorf("%s: %w", name, uerr)}
-				}
-				if size > 0 && fi.Size() == size {
-					notes = append(notes, fmt.Sprintf("「%s」本地已存在且大小一致", name))
+					// total unknown but file exists
+					focusID = existing.ID
+					notes = append(notes, fmt.Sprintf("「%s」已经下载完成", name))
 					continue
 				}
-				conflicts = append(conflicts, dlConflict{
-					name: name, url: urlStr, dest: dest, fid: fid, size: fi.Size(),
-					reason: "本地已存在同名文件",
-				})
+			} else {
+				switch existing.Status {
+				case download.StatusRunning, download.StatusQueued, download.StatusFinalizing, download.StatusPausing:
+					focusID = existing.ID
+					notes = append(notes, fmt.Sprintf("「%s」已在下载中", name))
+					continue
+				case download.StatusPaused, download.StatusError:
+					focusID = existing.ID
+					// resume this one only
+					if mgr.ResumeID(existing.ID) {
+						notes = append(notes, fmt.Sprintf("「%s」已恢复下载", name))
+					} else {
+						notes = append(notes, fmt.Sprintf("「%s」已在任务列表", name))
+					}
+					continue
+				case download.StatusCancel:
+					// remove cancel record and allow re-download
+					mgr.RemoveID(existing.ID)
+				}
+			}
+		}
+
+		// dest file exists without matching active task in this dir?
+		if fi, err := os.Stat(dest); err == nil {
+			urlStr, size, uerr := api.GetDownloadURL(cl, fid)
+			if uerr != nil {
+				return dlEnqueueMsg{err: fmt.Errorf("%s: %w", name, uerr)}
+			}
+			if size > 0 && fi.Size() == size {
+				notes = append(notes, fmt.Sprintf("「%s」本地已存在且大小一致", name))
 				continue
 			}
-
-			urlStr, _, err := api.GetDownloadURL(cl, fid)
-			if err != nil {
-				return dlEnqueueMsg{err: fmt.Errorf("%s: %w", name, err)}
-			}
-			jobs = append(jobs, dlJob{name: name, url: urlStr, dest: dest, fid: fid})
+			conflicts = append(conflicts, dlConflict{
+				name: name, url: urlStr, dest: dest, fid: fid, size: fi.Size(),
+				reason: "本地已存在同名文件",
+			})
+			continue
 		}
 
-		status := ""
-		if len(notes) > 0 {
-			status = strings.Join(notes, "；")
-		}
-		if len(jobs) == 0 && len(conflicts) == 0 {
-			if status == "" {
-				status = "没有新的下载任务"
-			}
-			return dlEnqueueMsg{focusID: focusID, status: status}
-		}
-		return dlEnqueueMsg{jobs: jobs, conflicts: conflicts, focusID: focusID, status: status}
+		// No link yet: it is fetched once the job takes a slot.
+		jobs = append(jobs, dlJob{name: name, dest: dest, fid: fid})
 	}
+
+	status := ""
+	if len(notes) > 0 {
+		status = strings.Join(notes, "；")
+	}
+	if len(jobs) == 0 && len(conflicts) == 0 {
+		if status == "" {
+			status = "没有新的下载任务"
+			if n := tree.Dirs(); n > 0 {
+				status = fmt.Sprintf("已创建 %d 个文件夹，没有需要下载的文件", n)
+			}
+		}
+		return dlEnqueueMsg{focusID: focusID, status: status}
+	}
+	return dlEnqueueMsg{jobs: jobs, conflicts: conflicts, focusID: focusID, status: status}
 }
 
 func fileSize(path string) int64 {
@@ -2075,6 +2277,9 @@ func (m model) viewBrowse() string {
 	if m.loading && m.status != "" {
 		foot = m.spinner.View() + " " + m.status
 	}
+	if m.scan.busy {
+		foot = m.spinner.View() + " 正在展开文件夹，准备下载…"
+	}
 	if selN := len(m.selected); selN > 0 {
 		foot = fmt.Sprintf("已选 %d  ·  %s", selN, foot)
 	}
@@ -2111,7 +2316,7 @@ func (m model) viewDownloads() string {
 	}
 	if len(list) == 0 {
 		b.WriteString("\n")
-		b.WriteString(helpStyle.Render("暂无下载任务。在网盘选中文件后按 d 开始下载。"))
+		b.WriteString(helpStyle.Render("暂无下载任务。在网盘选中文件或文件夹后按 d 开始下载。"))
 		b.WriteString("\n")
 		b.WriteString(helpStyle.Render("可在 ~/.config/goquark/config.json 修改 download_dir"))
 		b.WriteString("\n\n")
@@ -2700,6 +2905,30 @@ func (m model) notesToggleHit(x, y int) bool {
 	return false
 }
 
+// progressCancelHit reports whether (x, y) lands on the progress dialog's
+// abort button.
+func (m model) progressCancelHit(x, y int) bool {
+	if m.modalKind != "progress" {
+		return false
+	}
+	ox, oy, _, _ := m.overlayOrigin()
+	w := lipgloss.Width(btnCancel.Render(progressCancelLabel))
+	for i, line := range strings.Split(m.renderModal(), "\n") {
+		plain := xansi.Strip(line)
+		j := strings.Index(plain, progressCancelLabel)
+		if j < 0 {
+			continue
+		}
+		rowY := oy + i
+		if y < rowY-1 || y > rowY+1 {
+			continue
+		}
+		x0 := ox + xansi.StringWidth(plain[:j])
+		return x >= x0-1 && x < x0+w
+	}
+	return false
+}
+
 func (m model) renderModal() string {
 	switch m.modalKind {
 	case "confirm":
@@ -2749,6 +2978,30 @@ func (m model) renderModal() string {
 		// footer ANSI is preserved.
 		box := confirmBox.Copy().UnsetForeground().UnsetBold()
 		return box.Render(content)
+	case "progress":
+		title := lipgloss.NewStyle().
+			Bold(true).
+			Foreground(lipgloss.Color("42")).
+			Render(m.modalTitle)
+		btn := btnCancel.Render(progressCancelLabel)
+		if m.btnHover == 2 {
+			btn = btnCancelHover.Render(progressCancelLabel)
+		}
+		innerW := 44
+		bg := lipgloss.NewStyle().Background(lipgloss.Color("235"))
+		pad := max(0, (innerW-lipgloss.Width(btn))/2)
+		btnLine := bg.Render(strings.Repeat(" ", pad)) + btn
+		if rest := max(0, innerW-lipgloss.Width(btnLine)); rest > 0 {
+			btnLine += bg.Render(strings.Repeat(" ", rest))
+		}
+		footerDim := lipgloss.NewStyle().
+			Foreground(lipgloss.Color("241")).
+			Background(lipgloss.Color("235"))
+		// The hint deliberately avoids repeating the button label: the hit
+		// test finds the button by that text.
+		content := title + "\n\n" + m.modalBody + "\n\n" + btnLine + "\n\n" +
+			footerDim.Render("Esc 或点击上方按钮中止 · 其他操作不影响下载")
+		return confirmBox.Copy().UnsetForeground().UnsetBold().Render(content)
 	case "error":
 		footerDim := lipgloss.NewStyle().Foreground(lipgloss.Color("241")).Background(lipgloss.Color("235"))
 		body := modalTitle.Render(m.modalTitle) + "\n\n" + m.modalBody + "\n\n" + footerDim.Render("Enter / Esc 关闭 · 可点击")
@@ -3179,10 +3432,6 @@ func humanSize(n int64) string {
 	}
 	return fmt.Sprintf("%.1f PiB", f/1024)
 }
-
-// sanitizeName delegates to the download package so the TUI and the download
-// manager cannot drift apart on what a safe file name is.
-func sanitizeName(name string) string { return download.SanitizeFilename(name) }
 
 func strAny(v any) string {
 	if v == nil {

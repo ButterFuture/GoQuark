@@ -225,6 +225,12 @@ func downloadMultipart(ctx context.Context, hc *http.Client, dlURL, cookie, dest
 	// Buffered job queue: fixed workers pull continuously → no idle gap between parts.
 	// Queue depth > concurrency so a finishing worker always has the next part ready.
 	jobs := make(chan job, opt.Concurrency*4)
+	// The dispatcher parks on "jobs <-" once the queue is full. Any worker may
+	// bail out on an error, and if the last one does, nothing drains the queue
+	// again: without a second way out the dispatcher stays parked for the life
+	// of the process. quit is closed on every exit path from this function.
+	quit := make(chan struct{})
+	defer close(quit)
 	go func() {
 		defer close(jobs)
 		for off := int64(0); off < target; {
@@ -235,6 +241,8 @@ func downloadMultipart(ctx context.Context, hc *http.Client, dlURL, cookie, dest
 			if !pmap.done(off) {
 				select {
 				case <-ctx.Done():
+					return
+				case <-quit:
 					return
 				case jobs <- job{off, end}:
 				}
@@ -503,10 +511,17 @@ func (r *speedReporter) Stop() {
 
 // --- part map ---
 
+// partMap records which parts of a multi-part download already reached disk.
+// Done is written by the part workers while the dispatcher and the periodic
+// flush read it, so every access goes through mu. A plain Mutex is enough at
+// this traffic and it keeps the rule easy to hold: no method here calls
+// another, so none can deadlock on a lock it already owns.
 type partMap struct {
 	PartSize int             `json:"part_size"`
 	Total    int64           `json:"total"`
 	Done     map[string]bool `json:"done"`
+
+	mu sync.Mutex
 }
 
 func newPartMap(partSize int, total int64) *partMap {
@@ -530,33 +545,56 @@ func loadPartMap(dest string, partSize int, total int64) *partMap {
 }
 
 func savePartMap(dest string, p *partMap) error {
-	b, err := json.Marshal(p)
+	b, err := p.encode()
 	if err != nil {
 		return err
 	}
 	return os.WriteFile(partMapPath(dest), b, 0o600)
 }
 
-func (p *partMap) key(start int64) string {
-	return fmt.Sprintf("%d", start)
+// encode marshals the map with mu held. Encoding in place, rather than from a
+// copy, is what stops the encoder from ranging over Done while a worker marks
+// a part: that is a hard runtime fault, not a stale read. wire carries the
+// same JSON shape without the mutex.
+func (p *partMap) encode() ([]byte, error) {
+	type wire struct {
+		PartSize int             `json:"part_size"`
+		Total    int64           `json:"total"`
+		Done     map[string]bool `json:"done"`
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return json.Marshal(wire{PartSize: p.PartSize, Total: p.Total, Done: p.Done})
+}
+
+// partKey names a part by its starting offset. Same text as before, so part
+// files written by older builds still load.
+func partKey(start int64) string {
+	return strconv.FormatInt(start, 10)
 }
 
 func (p *partMap) done(start int64) bool {
-	return p.Done[p.key(start)]
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.Done[partKey(start)]
 }
 
 func (p *partMap) mark(start int64) {
-	p.Done[p.key(start)] = true
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.Done[partKey(start)] = true
 }
 
 func (p *partMap) completedBytes() int64 {
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	var n int64
 	for off := int64(0); off < p.Total; {
 		end := off + int64(p.PartSize) - 1
 		if end >= p.Total {
 			end = p.Total - 1
 		}
-		if p.done(off) {
+		if p.Done[partKey(off)] {
 			n += end - off + 1
 		}
 		off = end + 1

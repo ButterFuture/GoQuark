@@ -97,6 +97,12 @@ type PersistTask struct {
 // maxFinishedKeep caps completed/cancelled rows kept on disk (active always kept).
 const maxFinishedKeep = 200
 
+// maxLiveDownloads caps how many files are fetched at once. A recursive folder
+// download can queue hundreds, and each one opens its own set of range
+// connections; without a cap the drive end starts refusing them and every task
+// crawls. Per-file chunk concurrency is separate and unchanged.
+const maxLiveDownloads = 3
+
 // Manager tracks concurrent downloads for TUI + CLI.
 type Manager struct {
 	mu        sync.RWMutex
@@ -106,6 +112,9 @@ type Manager struct {
 	destDir   string
 	statePath string
 	loaded    bool
+	// live hands out the maxLiveDownloads file slots; a task parks on it until
+	// one is free.
+	live chan struct{}
 	// optional: re-resolve URL from fid on resume
 	ResolveURL func(fid string) (url string, total int64, err error)
 }
@@ -129,7 +138,7 @@ func NewManager(c *client.Client, destDir string) *Manager {
 	if destDir == "" {
 		destDir = "downloads"
 	}
-	m := &Manager{client: c, destDir: destDir}
+	m := &Manager{client: c, destDir: destDir, live: make(chan struct{}, maxLiveDownloads)}
 	m.statePath = defaultStatePath()
 	return m
 }
@@ -210,10 +219,17 @@ func (m *Manager) EnqueueEx(opt EnqueueOpts) (*Task, error) {
 	}
 	dest := opt.Dest
 	if dest == "" {
-		_ = os.MkdirAll(m.destDir, 0o755)
 		dest = filepath.Join(m.destDir, sanitize(opt.Name))
-	} else {
-		_ = os.MkdirAll(filepath.Dir(dest), 0o755)
+	}
+	// Two tasks on one file would interleave their parts and share a single
+	// .gqparts, and the loser would still report as complete. Different cloud
+	// nodes can reach the same local path, so this is checked here rather than
+	// trusted to the caller.
+	if busy := m.busyAtLocked(dest); busy != nil {
+		return nil, fmt.Errorf("目标路径已有下载任务：%s", dest)
+	}
+	if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
+		return nil, fmt.Errorf("创建下载目录：%w", err)
 	}
 	m.seq++
 	id := fmt.Sprintf("dl-%d-%d", time.Now().Unix()%100000, m.seq)
@@ -227,21 +243,29 @@ func (m *Manager) EnqueueEx(opt EnqueueOpts) (*Task, error) {
 		CreatedAt: time.Now(),
 	}
 	m.tasks = append(m.tasks, t)
-	cl := m.client
-	go m.run(cl, t, false)
+	m.launchLocked(m.client, t, false)
 	_ = m.saveLocked()
 	return t, nil
 }
 
-func (m *Manager) run(cl *client.Client, t *Task, resume bool) {
+// launchLocked starts t's download goroutine. The wait-group counter has to be
+// raised here, with m.mu still held, rather than inside run: a pause or a quit
+// that reaches wg.Wait in between would otherwise see a zero counter and
+// conclude the task had already stopped. Callers hold m.mu.
+func (m *Manager) launchLocked(cl *client.Client, t *Task, resume bool) {
 	t.wg.Add(1)
 	t.running.Store(true)
+	go m.run(cl, t, resume)
+}
+
+func (m *Manager) run(cl *client.Client, t *Task, resume bool) {
 	defer func() {
 		t.running.Store(false)
 		t.wg.Done()
 	}()
 
 	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
 	m.mu.Lock()
 	// Only abort if cancelled while waiting to start.
@@ -259,6 +283,25 @@ func (m *Manager) run(cl *client.Client, t *Task, resume bool) {
 		return
 	}
 	t.cancel = cancel
+	m.mu.Unlock()
+
+	// Park until one of the file slots frees up. m.mu must be released first:
+	// waiting with it held would freeze every other task, and the TUI with
+	// them, for as long as the queue is busy.
+	select {
+	case m.live <- struct{}{}:
+		defer func() { <-m.live }()
+	case <-ctx.Done():
+		return
+	}
+
+	m.mu.Lock()
+	// Sitting in the queue is where a pause or a cancel is most likely to land,
+	// so the status has to be read again now that the slot is ours.
+	if ctx.Err() != nil || t.Status != StatusQueued {
+		m.mu.Unlock()
+		return
+	}
 	t.Status = StatusRunning
 	// first start or resume: mark segment start for elapsed accumulation
 	t.StartedAt = time.Now()
@@ -269,9 +312,12 @@ func (m *Manager) run(cl *client.Client, t *Task, resume bool) {
 	resolve := m.ResolveURL
 	m.mu.Unlock()
 
-	// refresh URL if we have fid resolver (CDN links expire)
+	// Resolve the link now, not at enqueue time: a CDN link handed out while
+	// the task waited its turn may already have expired.
+	var resolveErr error
 	if (urlStr == "" || resume) && fid != "" && resolve != nil {
 		u, _, err := resolve(fid)
+		resolveErr = err
 		if err == nil && u != "" {
 			urlStr = u
 			m.mu.Lock()
@@ -279,7 +325,15 @@ func (m *Manager) run(cl *client.Client, t *Task, resume bool) {
 			m.mu.Unlock()
 		}
 	}
+	if ctx.Err() != nil {
+		// paused or cancelled while resolving; leave the status alone
+		return
+	}
 	if urlStr == "" {
+		if resolveErr != nil {
+			m.finish(t, StatusError, resolveErr)
+			return
+		}
 		m.finish(t, StatusError, fmt.Errorf("empty download url"))
 		return
 	}
@@ -561,8 +615,12 @@ func (m *Manager) cancelMany(ids map[string]bool, wait bool) int {
 // ResumeID resumes one paused/error task.
 func (m *Manager) ResumeID(id string) bool {
 	m.mu.Lock()
-	var t *Task
+	defer m.mu.Unlock()
 	cl := m.client
+	if cl == nil {
+		return false
+	}
+	var t *Task
 	for _, x := range m.tasks {
 		// allow retry on any error, and resume paused/incomplete
 		if x.ID != id {
@@ -575,7 +633,6 @@ func (m *Manager) ResumeID(id string) bool {
 			continue
 		}
 		if x.running.Load() {
-			m.mu.Unlock()
 			return false
 		}
 		// CRITICAL: must leave StatusPaused before go run().
@@ -587,11 +644,10 @@ func (m *Manager) ResumeID(id string) bool {
 		t = x
 		break
 	}
-	m.mu.Unlock()
-	if t == nil || cl == nil {
+	if t == nil {
 		return false
 	}
-	go m.run(cl, t, true)
+	m.launchLocked(cl, t, true)
 	return true
 }
 
@@ -843,27 +899,76 @@ func (m *Manager) FindByFIDInDir(fid, destDir string) *Snapshot {
 	destDir = filepath.Clean(destDir)
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	var best *Task
-	for _, t := range m.tasks {
-		if t.FID != fid {
-			continue
-		}
-		if filepath.Clean(filepath.Dir(t.Dest)) != destDir {
-			continue
-		}
-		// prefer active/paused over done; among same class take last
-		if best == nil {
-			best = t
-			continue
-		}
-		if rankStatus(t.Status) >= rankStatus(best.Status) {
-			best = t
-		}
-	}
-	if best == nil {
+	return snapOf(m.findLocked(func(t *Task) bool {
+		return t.FID == fid && filepath.Clean(filepath.Dir(t.Dest)) == destDir
+	}))
+}
+
+// FindAtDest returns the task for fid at exactly dest. A recursive download can
+// place one cloud file at more than one path, so matching on the directory
+// alone the way FindByFIDInDir does would fold those into a single task and
+// skip all but the first.
+func (m *Manager) FindAtDest(fid, dest string) *Snapshot {
+	if fid == "" {
 		return nil
 	}
-	s := snap(best)
+	dest = filepath.Clean(dest)
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return snapOf(m.findLocked(func(t *Task) bool {
+		return t.FID == fid && filepath.Clean(t.Dest) == dest
+	}))
+}
+
+// BusyAtDest returns the task that currently holds dest, or nil. The TUI asks
+// before it unlinks a file to download it again.
+func (m *Manager) BusyAtDest(dest string) *Snapshot {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return snapOf(m.busyAtLocked(dest))
+}
+
+// findLocked returns the best task satisfying match: an active one in
+// preference to a finished one, and the later of two equals. Callers hold m.mu.
+func (m *Manager) findLocked(match func(*Task) bool) *Task {
+	var best *Task
+	for _, t := range m.tasks {
+		if !match(t) {
+			continue
+		}
+		if best == nil || rankStatus(t.Status) >= rankStatus(best.Status) {
+			best = t
+		}
+	}
+	return best
+}
+
+// busyAtLocked returns a task that still owns the file at dest. Callers hold
+// m.mu.
+func (m *Manager) busyAtLocked(dest string) *Task {
+	dest = filepath.Clean(dest)
+	return m.findLocked(func(t *Task) bool {
+		return holdsDest(t.Status) && filepath.Clean(t.Dest) == dest
+	})
+}
+
+// holdsDest is true while a task is still writing its file or is about to.
+// StatusPaused is deliberately absent: a paused task keeps its part file so it
+// can resume, but the user is allowed to replace it.
+func holdsDest(s Status) bool {
+	switch s {
+	case StatusRunning, StatusQueued, StatusFinalizing, StatusPausing:
+		return true
+	default:
+		return false
+	}
+}
+
+func snapOf(t *Task) *Snapshot {
+	if t == nil {
+		return nil
+	}
+	s := snap(t)
 	return &s
 }
 
@@ -915,8 +1020,12 @@ func (m *Manager) ResumeQuitPaused() int {
 
 func (m *Manager) resumePaused(all bool) int {
 	m.mu.Lock()
-	var toStart []*Task
+	defer m.mu.Unlock()
 	cl := m.client
+	if cl == nil {
+		return 0
+	}
+	n := 0
 	for _, t := range m.tasks {
 		switch t.Status {
 		case StatusPaused:
@@ -938,15 +1047,9 @@ func (m *Manager) resumePaused(all bool) int {
 		t.Error = ""
 		t.Speed = 0
 		t.AutoPausedByQuit = false // clear once we resume
-		toStart = append(toStart, t)
-	}
-	m.mu.Unlock()
-	if cl == nil {
-		return 0
-	}
-	n := 0
-	for _, t := range toStart {
-		go m.run(cl, t, true)
+		// Same slot limit applies, so a bulk resume queues rather than
+		// starting everything at once.
+		m.launchLocked(cl, t, true)
 		n++
 	}
 	return n

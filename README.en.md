@@ -15,7 +15,7 @@
 </p>
 
 <p align="center">
-  <img alt="version" src="https://img.shields.io/badge/version-1.0.5-blue">
+  <img alt="version" src="https://img.shields.io/badge/version-1.0.6-blue">
   <img alt="go" src="https://img.shields.io/badge/Go-1.26+-00ADD8?logo=go">
   <img alt="license" src="https://img.shields.io/badge/license-AGPL--3.0-blue">
   <img alt="platform" src="https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-lightgrey">
@@ -43,7 +43,7 @@ GoQuark is a **Go** client for Quark cloud drive, aimed at terminals and automat
 ## Features
 
 - QR login; local device profile with customizable name  
-- Multi-file downloads, download center, history  
+- Multi-file and recursive folder downloads, download center, history  
 - Pause / resume / cancel; safe shutdown on quit  
 - Browse & account info (`ls` / `whoami`)  
 - Terminal UI (mouse-friendly)  
@@ -54,7 +54,8 @@ GoQuark is a **Go** client for Quark cloud drive, aimed at terminals and automat
   <img src="docs/screenshot-tui.png" alt="GoQuark TUI" width="820">
 </p>
 
-> ⭐ If this project helps you, a **Star** would be greatly appreciated!
+> ⭐ If this project helps you, a **Star** would be greatly appreciated!  
+> 🤝 Issues and **pull requests** are welcome too — see [Contributing](#contributing).
 
 ---
 
@@ -95,7 +96,7 @@ curl -fsSL https://raw.githubusercontent.com/ButterFuture/GoQuark/main/scripts/i
 Default path: `~/.local/bin/goquark` (or `/usr/local/bin` if writable). Options:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/ButterFuture/GoQuark/main/scripts/install.sh | bash -s -- --version v1.0.5
+curl -fsSL https://raw.githubusercontent.com/ButterFuture/GoQuark/main/scripts/install.sh | bash -s -- --version v1.0.6
 curl -fsSL https://raw.githubusercontent.com/ButterFuture/GoQuark/main/scripts/install.sh | bash -s -- --dir ~/.local/bin
 ```
 
@@ -107,8 +108,8 @@ curl -fsSL https://raw.githubusercontent.com/ButterFuture/GoQuark/main/scripts/i
 4. `chmod +x` and place it on your `PATH` as `goquark`
 
 ```bash
-chmod +x goquark_1.0.5_linux_amd64
-sudo mv goquark_1.0.5_linux_amd64 /usr/local/bin/goquark
+chmod +x goquark_1.0.6_linux_amd64
+sudo mv goquark_1.0.6_linux_amd64 /usr/local/bin/goquark
 ```
 
 After install, **start with the TUI**:
@@ -170,11 +171,14 @@ Session cookies stay **local only**. Never commit or share a config that contain
 | Key | Action |
 |-----|--------|
 | Click / Space | Select |
-| `d` | Download selection |
+| `d` | Download selected files or folders (recursive) |
 | `t` | Download center |
 | Right-click / `m` | Menu |
 | `p` / `r` / `x` / `c` | Pause / resume / cancel / clear finished (in center) |
 | `q` | Quit (confirms; safely pauses active jobs) |
+
+Files and folders can be picked together. The selected folder's own name, every subdirectory and the empty ones are kept, so picking `docs` saves to `<download dir>/docs/sub/file`.
+The download center lists one task per file, runs at most 3 files at a time and queues the rest; per-file chunk concurrency is unchanged. The CLI and MCP download entry points take files only.
 
 ---
 
@@ -241,7 +245,7 @@ stdio server: host runs `goquark mcp` (**absolute path** required).
 
 | Item | Detail |
 |------|--------|
-| Source of truth | Root [`VERSION`](VERSION) (currently **1.0.5**) |
+| Source of truth | Root [`VERSION`](VERSION) (currently **1.0.6**) |
 | Build inject | `scripts/build.sh` / CI via `-ldflags` |
 | Local `go run` | Shows `dev` if not injected |
 
@@ -251,7 +255,7 @@ stdio server: host runs `goquark mcp` (**absolute path** required).
 goquark version
 ```
 
-Release flow: ship features → bump `VERSION` → tag `v1.0.5` → CI / Release.
+Release flow: ship features → bump `VERSION` → tag `v1.0.6` → CI / Release.
 
 ---
 
@@ -314,6 +318,23 @@ Include: identity & contact, paths/commits, rights basis, requested action.
 ---
 
 
+## Contributing
+
+**Issues** and **pull requests** are welcome — bug fixes, new features, docs and
+translation improvements alike.
+
+- Run `go build ./...`, `go vet ./...` and `go test -race ./...` before you open one
+- Follow `gofmt`; please cover new logic with tests
+- If a change writes files, joins paths or parses untrusted input, say in the PR
+  which edge cases you considered (path traversal, symlinks, two jobs writing one
+  file). Those changes get the closest review
+- Never include cookies, tokens or personal account data in a commit
+
+Treat every file name the drive returns as untrusted: sanitise each path
+component through `download.SanitizeFilename` before joining, never after.
+
+---
+
 ## Documentation
 
 | Doc | Description |
@@ -326,9 +347,14 @@ Include: identity & contact, paths/commits, rights basis, requested action.
 
 ## Status
 
-**v1.0.5** — Self-update fixes: concurrent updates no longer trip over each other, and the file Windows leaves behind is cleared at the next start; the update dialog now carries the release notes. On top of v1.0.4.
+Stable and actively maintained. QR login, browsing, multi-connection downloads,
+recursive folder downloads, the download center, resume, self-update and the MCP
+tools are all in place; binaries for each platform are on
+[Releases](https://github.com/ButterFuture/GoQuark/releases).
 
-Planned: public release channel, optional in-app update check, broader MCP tools.
+What changed in each version is in [`docs/CHANGELOG.md`](docs/CHANGELOG.md).
+
+Planned: folders through the CLI and MCP download entry points, broader MCP tools.
 
 ---
 

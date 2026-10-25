@@ -15,7 +15,7 @@
 </p>
 
 <p align="center">
-  <img alt="version" src="https://img.shields.io/badge/version-1.0.5-blue">
+  <img alt="version" src="https://img.shields.io/badge/version-1.0.6-blue">
   <img alt="go" src="https://img.shields.io/badge/Go-1.26+-00ADD8?logo=go">
   <img alt="license" src="https://img.shields.io/badge/license-AGPL--3.0-blue">
   <img alt="platform" src="https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-lightgrey">
@@ -43,7 +43,7 @@ GoQuark 是用 **Go** 写的夸克网盘客户端，面向命令行与自动化�
 ## 功能一览
 
 - 扫码登录，设备信息本地固定、可自定义名称  
-- 多文件下载、下载中心、历史记录  
+- 多文件与文件夹递归下载、下载中心、历史记录  
 - 暂停 / 继续 / 取消；退出时安全收尾  
 - 目录浏览、用户信息（`ls` / `whoami`）  
 - 终端 UI（支持鼠标）  
@@ -54,7 +54,8 @@ GoQuark 是用 **Go** 写的夸克网盘客户端，面向命令行与自动化�
   <img src="docs/screenshot-tui.png" alt="GoQuark TUI" width="820">
 </p>
 
-> ⭐ 如果这个项目对你有帮助，欢迎点个 **Star** 支持一下！
+> ⭐ 如果这个项目对你有帮助，欢迎点个 **Star** 支持一下！  
+> 🤝 也欢迎提 Issue 和 **Pull Request**，详见 [参与贡献](#参与贡献)。
 
 ---
 
@@ -96,7 +97,7 @@ curl -fsSL https://raw.githubusercontent.com/ButterFuture/GoQuark/main/scripts/i
 
 ```bash
 # 指定版本 / 目录
-curl -fsSL https://raw.githubusercontent.com/ButterFuture/GoQuark/main/scripts/install.sh | bash -s -- --version v1.0.5
+curl -fsSL https://raw.githubusercontent.com/ButterFuture/GoQuark/main/scripts/install.sh | bash -s -- --version v1.0.6
 curl -fsSL https://raw.githubusercontent.com/ButterFuture/GoQuark/main/scripts/install.sh | bash -s -- --dir ~/.local/bin
 ```
 
@@ -112,8 +113,8 @@ curl -fsSL https://raw.githubusercontent.com/ButterFuture/GoQuark/main/scripts/i
 4. `chmod +x goquark_*` 后移到 `PATH` 中，并重命名为 `goquark`
 
 ```bash
-chmod +x goquark_1.0.5_linux_amd64
-sudo mv goquark_1.0.5_linux_amd64 /usr/local/bin/goquark
+chmod +x goquark_1.0.6_linux_amd64
+sudo mv goquark_1.0.6_linux_amd64 /usr/local/bin/goquark
 ```
 
 安装完成后，**推荐直接启动 TUI**：
@@ -175,11 +176,14 @@ goquark version
 | 按键 | 作用 |
 |------|------|
 | 单击 / 空格 | 选择 |
-| `d` | 下载所选 |
+| `d` | 下载所选文件或文件夹（递归） |
 | `t` | 下载中心 |
 | 右键 / `m` | 菜单 |
 | `p` / `r` / `x` / `c` | 暂停 / 恢复 / 取消 / 清除已完成（中心内） |
 | `q` | 退出（确认后安全暂停进行中的任务） |
+
+文件与文件夹可以混选。所选文件夹的名称、各级子目录和空文件夹都会保留，选中 `资料` 后保存为 `下载目录/资料/子目录/文件`。
+下载中心按文件列任务，同时最多下载 3 个文件、其余排队，单个文件的分块并发设置不变。CLI 与 MCP 的下载入口目前只接受文件。
 
 ---
 
@@ -246,7 +250,7 @@ goquark version
 
 | 项目 | 说明 |
 |------|------|
-| 唯一来源 | 仓库根目录 [`VERSION`](VERSION)（当前 **1.0.5**） |
+| 唯一来源 | 仓库根目录 [`VERSION`](VERSION)（当前 **1.0.6**） |
 | 构建注入 | `scripts/build.sh` / CI 通过 `-ldflags` 写入二进制 |
 | 本地 `go run` | 未注入时显示 `dev` |
 
@@ -256,7 +260,7 @@ goquark version
 goquark version        # 查看已注入版本
 ```
 
-发版建议：改功能 → 确认 → 更新 `VERSION` → 打 tag `v1.0.5` → CI / Release。
+发版建议：改功能 → 确认 → 更新 `VERSION` → 打 tag `v1.0.6` → CI / Release。
 
 ---
 
@@ -319,6 +323,21 @@ Copyright (c) 2026 ButterFuture
 ---
 
 
+## 参与贡献
+
+欢迎 **Issue** 和 **Pull Request** —— Bug 修复、新功能、文档与翻译改进都欢迎。
+
+- 提交前请跑一遍 `go build ./...`、`go vet ./...` 和 `go test -race ./...`
+- 代码风格沿用 `gofmt`，新增逻辑尽量带上测试
+- 涉及文件写入、路径拼接或外部输入解析的改动，请在 PR 里说明你考虑过的边界情况
+  （路径穿越、符号链接、并发写同一文件等）。这类改动会被重点审查
+- 请不要在提交里夹带 Cookie、token 或个人账号信息
+
+网盘返回的文件名一律视为不可信输入：拼本地路径时逐个分量过
+`download.SanitizeFilename`，不要先拼再清理。
+
+---
+
 ## 文档目录
 
 | 文档 | 说明 |
@@ -331,9 +350,13 @@ Copyright (c) 2026 ButterFuture
 
 ## 状态
 
-**v1.0.5** — 自动更新修复：并发更新不再互相踩踏，Windows 遗留文件下次启动自动清理；更新对话框附带 Release 说明。在 v1.0.4 能力之上。
+稳定可用，持续维护中。扫码登录、目录浏览、多连接下载、文件夹递归下载、下载中心、
+断点续传、自动更新与 MCP 工具均已可用，各平台二进制见
+[Releases](https://github.com/ButterFuture/GoQuark/releases)。
 
-后续计划：公开仓正式发版通道、应用内检查更新（可选）、更丰富的 MCP 能力。
+每个版本的具体改动见 [`docs/CHANGELOG.md`](docs/CHANGELOG.md)。
+
+后续计划：CLI 与 MCP 的下载入口支持文件夹、更丰富的 MCP 能力。
 
 ---
 
