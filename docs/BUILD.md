@@ -65,7 +65,7 @@ go build -o goquark ./cmd/goquark
 
 ## Requirements
 
-- Go **1.22+** (1.23 recommended)
+- Go **1.26+** (the go directive in go.mod is 1.26.0)
 - `git`
 
 ## Clone & build

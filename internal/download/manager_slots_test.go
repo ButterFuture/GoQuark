@@ -17,7 +17,24 @@ func newTestManager(t *testing.T) *Manager {
 	t.Helper()
 	m := NewManager(client.New(&config.Config{}), t.TempDir())
 	m.SetStatePath(filepath.Join(t.TempDir(), "state.json"))
+	// Registered after the TempDirs, so it runs before they are removed: a
+	// task that winds down or a state write that lands during RemoveAll leaves
+	// the directory non-empty and fails the test that owned it.
+	t.Cleanup(func() { settle(m) })
 	return m
+}
+
+// settle waits until every task's goroutine has returned and the state writes
+// they queued are on disk. Tasks first: a task that is still finishing can
+// start another write.
+func settle(m *Manager) {
+	m.mu.RLock()
+	tasks := append([]*Task(nil), m.tasks...)
+	m.mu.RUnlock()
+	for _, task := range tasks {
+		task.wg.Wait()
+	}
+	m.saves.Wait()
 }
 
 // waitFor polls until cond holds, so the tests never depend on a fixed sleep.
@@ -52,7 +69,7 @@ func TestManagerCapsLiveDownloads(t *testing.T) {
 		return "", 0, errors.New("这个测试不提供链接")
 	}
 
-	const total = maxLiveDownloads * 2
+	const total = defaultMaxLive * 2
 	for i := 0; i < total; i++ {
 		dest := filepath.Join(t.TempDir(), fmt.Sprintf("%d.bin", i))
 		if _, err := m.EnqueueEx(EnqueueOpts{Name: fmt.Sprintf("f%d", i), FID: fmt.Sprintf("fid%d", i), Dest: dest}); err != nil {
@@ -60,7 +77,7 @@ func TestManagerCapsLiveDownloads(t *testing.T) {
 		}
 	}
 
-	waitFor(t, "名额被占满", func() bool { return live.Load() >= maxLiveDownloads })
+	waitFor(t, "名额被占满", func() bool { return live.Load() >= defaultMaxLive })
 	close(gate)
 	waitFor(t, "全部任务收尾", func() bool {
 		for _, s := range m.List() {
@@ -71,8 +88,55 @@ func TestManagerCapsLiveDownloads(t *testing.T) {
 		return true
 	})
 
-	if got := peak.Load(); got != maxLiveDownloads {
-		t.Fatalf("同时在下的文件数峰值为 %d，想要正好 %d（%d 个任务排队）", got, maxLiveDownloads, total)
+	if got := peak.Load(); got != defaultMaxLive {
+		t.Fatalf("同时在下的文件数峰值为 %d，想要正好 %d（%d 个任务排队）", got, defaultMaxLive, total)
+	}
+}
+
+// max_downloads changes the cap for the queue that is already waiting: raising
+// it starts more of the parked tasks at once.
+func TestSetMaxLiveAppliesToTheWaitingQueue(t *testing.T) {
+	m := newTestManager(t)
+	if got := m.SetMaxLive(2); got != 2 {
+		t.Fatalf("SetMaxLive(2) = %d", got)
+	}
+	var live atomic.Int64
+	gate := make(chan struct{})
+	m.ResolveURL = func(fid string) (string, int64, error) {
+		live.Add(1)
+		<-gate
+		live.Add(-1)
+		return "", 0, errors.New("这个测试不提供链接")
+	}
+	for i := 0; i < 6; i++ {
+		dest := filepath.Join(t.TempDir(), fmt.Sprintf("%d.bin", i))
+		if _, err := m.EnqueueEx(EnqueueOpts{Name: fmt.Sprintf("f%d", i), FID: fmt.Sprintf("fid%d", i), Dest: dest}); err != nil {
+			t.Fatalf("入队 %d：%v", i, err)
+		}
+	}
+	waitFor(t, "两个名额被占满", func() bool { return live.Load() == 2 })
+	m.SetMaxLive(5)
+	waitFor(t, "放宽到五个", func() bool { return live.Load() == 5 })
+	if l, q, limit := m.LiveCount(); l != 5 || q != 1 || limit != 5 {
+		t.Errorf("LiveCount = %d live, %d queued, limit %d; want 5, 1, 5", l, q, limit)
+	}
+	close(gate)
+	waitFor(t, "全部任务收尾", func() bool {
+		for _, s := range m.List() {
+			if holdsDest(s.Status) {
+				return false
+			}
+		}
+		return true
+	})
+}
+
+func TestSetMaxLiveBounds(t *testing.T) {
+	m := newTestManager(t)
+	for _, c := range []struct{ in, want int }{{0, defaultMaxLive}, {-1, defaultMaxLive}, {1, 1}, {10, 10}, {50, maxLiveCap}} {
+		if got := m.SetMaxLive(c.in); got != c.want {
+			t.Errorf("SetMaxLive(%d) = %d, want %d", c.in, got, c.want)
+		}
 	}
 }
 

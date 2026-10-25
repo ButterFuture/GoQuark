@@ -36,6 +36,7 @@ func Run(version string) error {
 	c := client.New(cfg)
 	mgr := download.Global()
 	mgr.BindClient(c)
+	mgr.SetMaxLive(cfg.MaxDownloads)
 	mgr.SetDestDir(cfg.EffectiveDownloadDir())
 	_, _ = mgr.LoadPersisted()
 
@@ -47,13 +48,15 @@ func Run(version string) error {
 	// ---- status / identity (agent-friendly) ----
 
 	s.AddTool(mcp.NewTool("goquark_status",
-		mcp.WithDescription("Session/config status without calling Quark APIs. Reports logged_in, config path, version, download_dir, device summary."),
+		mcp.WithDescription("Session/config status without calling Quark APIs. Reports logged_in, config path, version, download_dir, max_downloads, device summary."),
 	), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		_, _, maxLive := mgr.LiveCount()
 		out := map[string]any{
-			"version":      version,
-			"logged_in":    cfg.HasSessionCookie(),
-			"config_path":  cfg.Path(),
-			"download_dir": cfg.EffectiveDownloadDir(),
+			"version":       version,
+			"logged_in":     cfg.HasSessionCookie(),
+			"config_path":   cfg.Path(),
+			"download_dir":  cfg.EffectiveDownloadDir(),
+			"max_downloads": maxLive,
 			"device": map[string]string{
 				"device_name": cfg.Device.DeviceName,
 				"model":       cfg.Device.Model,
@@ -474,10 +477,52 @@ func Run(version string) error {
 				"fid":     t.FID,
 			})
 		}
+		live, queued, limit := mgr.LiveCount()
 		return textJSON(map[string]any{
-			"count": len(items),
-			"tasks": items,
+			"count":         len(items),
+			"tasks":         items,
+			"downloading":   live,
+			"queued":        queued,
+			"max_downloads": limit,
 		})
+	})
+
+	s.AddTool(mcp.NewTool("goquark_download_settings",
+		mcp.WithDescription("Read or change how many files download at once (max_downloads; the rest queue). Without arguments, reports the current limit and how many files are downloading and queued. With max_downloads (1-10, 0 = default 3), applies it at once to the running queue and, unless persist=false, saves it to config.json so the TUI and CLI use it too."),
+		mcp.WithNumber("max_downloads", mcp.Description("Files to download at once, 1-10; 0 restores the default (3). Omit to only read the settings.")),
+		mcp.WithBoolean("persist", mcp.Description("Save to config.json (default true). false changes this MCP session only."), mcp.DefaultBool(true)),
+	), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		const unset = -1
+		out := map[string]any{"config_path": cfg.Path(), "range": "1-10, 0 = default 3"}
+		if want := argInt(req, "max_downloads", unset); want != unset {
+			if want < 0 {
+				return mcp.NewToolResultError("max_downloads cannot be negative"), nil
+			}
+			applied := mgr.SetMaxLive(want)
+			out["requested"] = want
+			out["persisted"] = false
+			if argBool(req, "persist", true) {
+				// Re-read the file rather than saving this process's copy: the
+				// TUI or a CLI login may have rewritten it since MCP started.
+				fresh, err := config.Load(cfg.Path())
+				if err != nil {
+					return mcp.NewToolResultError(fmt.Sprintf("applied %d but could not read config: %v", applied, err)), nil
+				}
+				fresh.MaxDownloads = want
+				if want > applied {
+					fresh.MaxDownloads = applied
+				}
+				if err := fresh.Save(); err != nil {
+					return mcp.NewToolResultError(fmt.Sprintf("applied %d but could not save config: %v", applied, err)), nil
+				}
+				out["persisted"] = true
+			}
+		}
+		live, queued, limit := mgr.LiveCount()
+		out["max_downloads"] = limit
+		out["downloading"] = live
+		out["queued"] = queued
+		return textJSON(out)
 	})
 
 	s.AddTool(mcp.NewTool("goquark_download_control",

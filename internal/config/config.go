@@ -39,6 +39,9 @@ type Config struct {
 	// Download defaults (VIP-like official fallback)
 	PartSize    int `json:"part_size"`    // bytes, default 4MiB
 	Concurrency int `json:"concurrency"` // default 12
+	// MaxDownloads is how many files download at once; the rest queue.
+	// 0 → 3, at most 10.
+	MaxDownloads int `json:"max_downloads,omitempty"`
 	// DownloadDir is where files are saved. Empty → system Downloads/GoQuark.
 	// Example: "/home/chen/Downloads/GoQuark"
 	DownloadDir string `json:"download_dir,omitempty"`

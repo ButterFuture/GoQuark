@@ -199,8 +199,21 @@ type model struct {
 		gen    uint64
 		cancel context.CancelFunc
 	}
-	// downloads center cursor
+	// downloads center: cursor and first visible row in the open level, the
+	// folders opened to get there, and the row a menu was opened on
 	dlCursor int
+	dlOffset int
+	dlPath   []dlCrumb
+	dlTarget *dlRow
+	// the row under the cursor at the last sync, and where it was: rows move
+	// as their status changes, and a cursor nobody moved stays on its row
+	dlCursorKey    string
+	dlSyncedCursor int
+	// where each row sits; a row that changes status moves only after a while
+	dlPlaces dlPlaces
+	// double-click on a folder row opens it
+	dlLastClickIdx  int
+	dlLastClickTime time.Time
 	// startup resume prompt
 	pendingResumeAsk int
 	// version / update
@@ -254,6 +267,7 @@ type updateApplyMsg struct {
 type pauseDoneMsg struct{}
 type dlJob struct {
 	name, url, dest, fid string
+	size                 int64 // as listed; 0 if unknown
 	resume               bool
 	replace              bool // delete existing dest before download
 }
@@ -304,6 +318,7 @@ func Run(cfg *config.Config, opts Options) error {
 
 	mgr := download.Global()
 	mgr.BindClient(c)
+	mgr.SetMaxLive(cfg.MaxDownloads)
 	dlDir := cfg.EffectiveDownloadDir()
 	_ = os.MkdirAll(dlDir, 0o755)
 	mgr.SetDestDir(dlDir)
@@ -462,6 +477,22 @@ func pollLogin(statusCh <-chan string, doneCh <-chan error, qrCh <-chan qrReadyM
 }
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	next, cmd := m.update(msg)
+	// The download list changes under the cursor on every tick, so the cursor
+	// and scroll window are put right after each message rather than in every
+	// place that can move them.
+	if nm, ok := next.(model); ok {
+		if nm.inDownloads() {
+			nm.syncDownloads()
+		} else if _, tick := msg.(dlTickMsg); tick {
+			nm.settleDownloads()
+		}
+		next = nm
+	}
+	return next, cmd
+}
+
+func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.width, m.height = msg.Width, msg.Height
@@ -656,7 +687,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				_ = os.Remove(j.dest + ".gqparts")
 			}
 			t, err := m.dlMgr.EnqueueEx(download.EnqueueOpts{
-				Name: j.name, URL: j.url, Dest: j.dest, FID: j.fid,
+				Name: j.name, URL: j.url, Dest: j.dest, FID: j.fid, Size: j.size,
 			})
 			if err != nil {
 				return m.showModal("下载失败", err.Error(), "error", modeBrowse), nil
@@ -666,6 +697,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 		m.mode = modeDownloads
+		m.dlHome()
 		focus := msg.focusID
 		if focus == "" {
 			focus = lastID
@@ -673,11 +705,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if focus != "" {
 			m.dlFocusID = focus
 			m.dlFocusUntil = time.Now().Add(4 * time.Second)
-			if idx := m.dlMgr.DisplayIndex(focus); idx >= 0 {
+			// a file of a folder download lands on its top-level folder
+			if idx := dlRowOf(m.dlRows(), focus); idx >= 0 {
 				m.dlCursor = idx
 			}
-		} else {
-			m.dlCursor = 0
 		}
 		if msg.status != "" {
 			m.dlMsg = msg.status
@@ -1130,22 +1161,10 @@ func (m model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 
 	// download center: right-click opens download management menu (stay here)
 	if m.mode == modeDownloads {
+		rows := m.dlRows()
 		if msg.Action == tea.MouseActionPress && msg.Button == tea.MouseButtonRight {
-			// map y to display row roughly (header ~3 lines: title, path, blank-ish)
-			// simple: each task ~3 lines; cursor already tracks keyboard
-			// still try to pick row near click
-			if m.dlMgr != nil {
-				n := len(m.dlMgr.List())
-				// list starts after title+path (~2 lines) + blank
-				rel := msg.Y - 3
-				if rel >= 0 && n > 0 {
-					// 3 lines per task in viewDownloads
-					idx := rel / 3
-					if idx >= n {
-						idx = n - 1
-					}
-					m.dlCursor = idx
-				}
+			if idx, ok := m.dlRowAt(msg.Y, len(rows)); ok {
+				m.dlCursor = idx
 			}
 			return m.openMenuAt(msg.X, msg.Y), nil
 		}
@@ -1153,32 +1172,29 @@ func (m model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		if msg.Action == tea.MouseActionRelease && msg.Button == tea.MouseButtonLeft {
-			if m.dlMgr != nil {
-				n := len(m.dlMgr.List())
-				rel := msg.Y - 3
-				if rel >= 0 && n > 0 {
-					idx := rel / 3
-					if idx >= n {
-						idx = n - 1
-					}
-					m.dlCursor = idx
-				}
+			idx, ok := m.dlRowAt(msg.Y, len(rows))
+			if !ok {
+				return m, nil
 			}
+			now := time.Now()
+			if idx == m.dlLastClickIdx && now.Sub(m.dlLastClickTime) < 400*time.Millisecond && rows[idx].dir {
+				m.dlLastClickTime = time.Time{}
+				m.dlCursor = idx
+				m.dlOpenFolder(rows[idx])
+				return m, nil
+			}
+			m.dlLastClickIdx = idx
+			m.dlLastClickTime = now
+			m.dlCursor = idx
 			return m, nil
 		}
+		// syncDownloads clamps the cursor and scrolls it into view afterwards
 		if msg.Button == tea.MouseButtonWheelUp {
-			if m.dlCursor > 0 {
-				m.dlCursor--
-			}
+			m.dlCursor--
 			return m, nil
 		}
 		if msg.Button == tea.MouseButtonWheelDown {
-			if m.dlMgr != nil {
-				n := len(m.dlMgr.List())
-				if m.dlCursor < n-1 {
-					m.dlCursor++
-				}
-			}
+			m.dlCursor++
 			return m, nil
 		}
 		return m, nil
@@ -1372,25 +1388,35 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 	case modeDownloads:
+		// syncDownloads clamps the cursor afterwards, so moves need no bounds
 		switch key {
 		case "esc", "backspace", "h", "left", "b":
+			if len(m.dlPath) > 0 {
+				m.dlLeaveFolder()
+				return m, nil
+			}
 			m.mode = modeBrowse
 			return m, nil
+		case "enter", "l", "right":
+			if rows := m.dlRows(); m.dlCursor >= 0 && m.dlCursor < len(rows) && rows[m.dlCursor].dir {
+				m.dlOpenFolder(rows[m.dlCursor])
+			}
 		case "q":
 			return m.showConfirm("退出程序", "确定要退出 GoQuark 吗？", "quit"), nil
 		case "ctrl+c":
 			return m.showConfirm("退出程序", "确定要退出 GoQuark 吗？", "quit"), nil
 		case "up", "k":
-			if m.dlCursor > 0 {
-				m.dlCursor--
-			}
+			m.dlCursor--
 		case "down", "j":
-			if m.dlMgr != nil {
-				n := len(m.dlMgr.List())
-				if m.dlCursor < n-1 {
-					m.dlCursor++
-				}
-			}
+			m.dlCursor++
+		case "pgup":
+			m.dlCursor -= m.dlListH()
+		case "pgdown":
+			m.dlCursor += m.dlListH()
+		case "home", "g":
+			m.dlCursor = 0
+		case "end", "e":
+			m.dlCursor = len(m.dlRows()) - 1
 		case "c":
 			if m.dlMgr != nil {
 				n := m.dlMgr.ClearFinished()
@@ -1412,8 +1438,8 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		case "x": // cancel all (confirm)
 			return m.showConfirm("全部取消", "确定取消全部下载任务？\n未完成的进度会保留在本地，但任务将标记为取消。", "cancel_all_downloads"), nil
 		case "m", "f10":
-			// keyboard open download menu
-			return m.openMenuAt(4, 4), nil
+			// keyboard: open the menu beside the focused row
+			return m.openMenuAt(4, dlHeaderLines+(m.dlCursor-m.dlOffset)*dlRowLines+1), nil
 		}
 		return m, nil
 	}
@@ -1485,7 +1511,7 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "t":
 		// download center (avoid d/D case collision)
 		m.mode = modeDownloads
-		m.dlCursor = 0
+		m.dlHome()
 		return m, nil
 	case "m", "f10":
 		x, y := 4, m.listTop+(m.cursor-m.offset)*rowHeight
@@ -1516,6 +1542,13 @@ func (m model) openMenuAt(x, y int) model {
 	m.menuIgnoreRightRelease = true
 
 	if from == modeDownloads {
+		// Remember the row itself: the list keeps moving while the menu is
+		// open, and the action has to hit what was clicked.
+		m.dlTarget = nil
+		if rows := m.dlRows(); m.dlCursor >= 0 && m.dlCursor < len(rows) {
+			r := rows[m.dlCursor]
+			m.dlTarget = &r
+		}
 		m.menuItems = m.downloadMenuItems()
 	} else {
 		m.menuItems = []menuEntry{
@@ -1550,12 +1583,21 @@ func (m model) openMenuAt(x, y int) model {
 
 func (m model) downloadMenuItems() []menuEntry {
 	items := []menuEntry{}
-	var snap *download.Snapshot
-	if m.dlMgr != nil {
-		snap = m.dlMgr.AtDisplay(m.dlCursor)
-	}
-	if snap != nil {
-		switch snap.Status {
+	if r := m.dlTarget; r != nil && r.dir {
+		items = append(items, menuEntry{id: "dl_open", label: "打开文件夹"})
+		a := r.agg
+		moving := a.status == download.StatusRunning || a.status == download.StatusQueued
+		if moving {
+			items = append(items, menuEntry{id: "dl_pause", label: "暂停整个文件夹"})
+		}
+		if a.doneN < a.files && !moving && a.status != download.StatusPausing {
+			items = append(items, menuEntry{id: "dl_resume", label: "继续整个文件夹"})
+		}
+		if a.doneN < a.files && a.status != download.StatusCancel {
+			items = append(items, menuEntry{id: "dl_cancel", label: "取消整个文件夹"})
+		}
+	} else if r != nil {
+		switch r.tasks[0].Status {
 		case download.StatusRunning, download.StatusQueued, download.StatusFinalizing:
 			items = append(items, menuEntry{id: "dl_pause", label: "暂停此任务"})
 			items = append(items, menuEntry{id: "dl_cancel", label: "取消此任务"})
@@ -1567,6 +1609,9 @@ func (m model) downloadMenuItems() []menuEntry {
 		case download.StatusDone:
 			items = append(items, menuEntry{id: "dl_open_path", label: "显示路径"})
 		}
+	}
+	if len(m.dlPath) > 0 {
+		items = append(items, menuEntry{id: "dl_up", label: "返回上一层"})
 	}
 	items = append(items,
 		menuEntry{id: "dl_pause_all", label: "全部暂停"},
@@ -1634,7 +1679,7 @@ func (m model) applyMenu(id string) (tea.Model, tea.Cmd) {
 		return m.doDownload()
 	case "downloads":
 		m.mode = modeDownloads
-		m.dlCursor = 0
+		m.dlHome()
 		return m, nil
 	case "select_all":
 		m.selected = map[int]bool{}
@@ -1658,37 +1703,48 @@ func (m model) applyMenu(id string) (tea.Model, tea.Cmd) {
 	case "quit":
 		return m.showConfirm("退出程序", "确定要退出 GoQuark 吗？", "quit"), nil
 	// download-center menu
+	case "dl_open":
+		m.mode = modeDownloads
+		if r := m.dlTarget; r != nil && r.dir {
+			m.dlOpenFolder(*r)
+		}
+		return m, nil
+	case "dl_up":
+		m.mode = modeDownloads
+		if len(m.dlPath) > 0 {
+			m.dlLeaveFolder()
+		}
+		return m, nil
 	case "dl_pause":
-		if m.dlMgr != nil {
-			if s := m.dlMgr.AtDisplay(m.dlCursor); s != nil {
-				if m.dlMgr.PauseID(s.ID) {
-					m.status = "正在暂停: " + s.Name
-				}
+		if r := m.dlTarget; m.dlMgr != nil && r != nil {
+			if m.dlMgr.PauseIDs(r.ids()) > 0 {
+				m.status = "正在暂停: " + r.name
 			}
 		}
 		m.mode = modeDownloads
 		return m, nil
 	case "dl_resume":
-		if m.dlMgr != nil {
-			if s := m.dlMgr.AtDisplay(m.dlCursor); s != nil {
-				if m.dlMgr.ResumeID(s.ID) {
-					m.status = "继续下载: " + s.Name
-				} else {
-					m.status = "无法继续: " + s.Name + "（可能已在运行或状态不对）"
-				}
+		if r := m.dlTarget; m.dlMgr != nil && r != nil {
+			if m.dlMgr.ResumeIDs(r.ids()) > 0 {
+				m.status = "继续下载: " + r.name
+			} else {
+				m.status = "无法继续: " + r.name + "（可能已在运行或状态不对）"
 			}
 		}
 		m.mode = modeDownloads
 		return m, nil
 	case "dl_cancel":
-		if m.dlMgr != nil {
-			if s := m.dlMgr.AtDisplay(m.dlCursor); s != nil {
-				if m.dlMgr.CancelID(s.ID) {
-					m.status = "已取消: " + s.Name
-				}
+		m.mode = modeDownloads
+		if r := m.dlTarget; r != nil && r.dir {
+			return m.showConfirm("取消文件夹",
+				fmt.Sprintf("确定取消「%s」里未完成的 %d 个文件？\n已完成的文件不受影响，未完成的进度会保留在本地。",
+					r.name, r.agg.files-r.agg.doneN), "cancel_dl_folder"), nil
+		}
+		if r := m.dlTarget; m.dlMgr != nil && r != nil {
+			if m.dlMgr.CancelIDs(r.ids()) > 0 {
+				m.status = "已取消: " + r.name
 			}
 		}
-		m.mode = modeDownloads
 		return m, nil
 	case "dl_pause_all":
 		if m.dlMgr != nil {
@@ -1715,10 +1771,8 @@ func (m model) applyMenu(id string) (tea.Model, tea.Cmd) {
 		m.mode = modeDownloads
 		return m, nil
 	case "dl_open_path":
-		if m.dlMgr != nil {
-			if s := m.dlMgr.AtDisplay(m.dlCursor); s != nil {
-				m.status = s.Dest
-			}
+		if r := m.dlTarget; r != nil && !r.dir {
+			m.status = r.tasks[0].Dest
 		}
 		m.mode = modeDownloads
 		return m, nil
@@ -1752,6 +1806,13 @@ func (m model) runConfirmed(action string) (tea.Model, tea.Cmd) {
 			m.status = fmt.Sprintf("已取消 %d 个任务", n)
 			m.mode = modeDownloads
 		}
+		return m, nil
+	case "cancel_dl_folder":
+		if r := m.dlTarget; m.dlMgr != nil && r != nil {
+			n := m.dlMgr.CancelIDs(r.ids())
+			m.status = fmt.Sprintf("已取消「%s」里的 %d 个文件", r.name, n)
+		}
+		m.mode = modeDownloads
 		return m, nil
 	case "conflict_replace":
 		return m.resolveConflict(true)
@@ -1961,8 +2022,9 @@ func (m model) selectedCount() int {
 // them is the download planner's job, not this function's.
 func (m model) selectedEntries() []api.FileEntry {
 	var out []api.FileEntry
-	for i, on := range m.selected {
-		if !on || i < 0 || i >= len(m.rows) {
+	// in row order, not map order: this is the order the files queue in
+	for i := range m.rows {
+		if !m.selected[i] {
 			continue
 		}
 		if r := m.rows[i]; r.entry.Name != ".." {
@@ -2158,7 +2220,7 @@ func planDownloads(ctx context.Context, cl *client.Client, mgr *download.Manager
 		}
 
 		// No link yet: it is fetched once the job takes a slot.
-		jobs = append(jobs, dlJob{name: name, dest: dest, fid: fid})
+		jobs = append(jobs, dlJob{name: name, dest: dest, fid: fid, size: item.Entry.Size})
 	}
 
 	status := ""
@@ -2293,28 +2355,33 @@ func (m model) viewBrowse() string {
 
 func (m model) viewDownloads() string {
 	var b strings.Builder
-	b.WriteString(titleStyle.Render("GoQuark 下载中心"))
+	head := titleStyle.Render("GoQuark 下载中心")
+	for _, c := range m.dlPath {
+		head += pathStyle.Render(" › ") + nameDir.Render(c.name)
+	}
 	if m.dlMgr != nil {
-		n := m.dlMgr.ActiveCount()
-		if n > 0 {
-			b.WriteString("  " + m.spinner.View() + " " + fmt.Sprintf("%d 进行中", n))
+		if live, queued, limit := m.dlMgr.LiveCount(); live+queued > 0 {
+			head += "  " + m.spinner.View() + " " + fmt.Sprintf("同时下载 %d/%d · 排队 %d", live, limit, queued)
 		}
 	}
+	// one line each, however narrow the terminal: the rows below are counted
+	b.WriteString(xansi.Truncate(head, max(1, m.width), "…"))
 	b.WriteString("\n")
 
-	// show download root path (always)
+	// show download root path (always), or the folder that is open
 	dlRoot := m.cfg.EffectiveDownloadDir()
 	if m.dlMgr != nil && m.dlMgr.DestDir() != "" {
 		dlRoot = m.dlMgr.DestDir()
 	}
-	b.WriteString(pathStyle.Render("保存到: " + dlRoot))
+	where := dlRoot
+	if len(m.dlPath) > 0 {
+		where = m.dlPath[len(m.dlPath)-1].key
+	}
+	b.WriteString(pathStyle.Render(truncate("保存到: "+where, max(20, m.width))))
 	b.WriteString("\n")
 
-	var list []download.Snapshot
-	if m.dlMgr != nil {
-		list = m.dlMgr.List()
-	}
-	if len(list) == 0 {
+	rows := m.dlRows()
+	if len(rows) == 0 {
 		b.WriteString("\n")
 		b.WriteString(helpStyle.Render("暂无下载任务。在网盘选中文件或文件夹后按 d 开始下载。"))
 		b.WriteString("\n")
@@ -2323,42 +2390,52 @@ func (m model) viewDownloads() string {
 		b.WriteString(helpStyle.Render("esc/b 返回网盘 · t 打开本页"))
 		return b.String()
 	}
-	if m.dlCursor >= len(list) {
-		m.dlCursor = len(list) - 1
+
+	// Only the window that fits is drawn, padded to its full height so the
+	// footer stays put. Drawing every row let the terminal cut the overflow
+	// off the top, and the cursor went with it.
+	h := m.dlListH()
+	cursor, offset := clampWindow(m.dlCursor, m.dlOffset, len(rows), h)
+	shown := 0
+	for i := offset; i < len(rows) && shown < h; i++ {
+		b.WriteString(m.renderDownloadRow(rows[i], i == cursor, dlRoot))
+		b.WriteString("\n")
+		shown++
 	}
-	if m.dlCursor < 0 {
-		m.dlCursor = 0
+	for ; shown < h; shown++ {
+		b.WriteString(strings.Repeat("\n", dlRowLines))
 	}
 
-	// List() already: active group on top, finished below; chronological within group.
-	for i, s := range list {
-		focused := i == m.dlCursor
-		b.WriteString(m.renderDownloadItem(s, focused, dlRoot))
-		b.WriteString("\n")
-	}
-	// section summary — do NOT count paused/error as "进行中"
-	runningN, pausedN, doneN := 0, 0, 0
-	for _, s := range list {
-		switch s.Status {
-		case download.StatusRunning, download.StatusQueued, download.StatusFinalizing, download.StatusPausing:
-			runningN++
-		case download.StatusPaused:
-			pausedN++
-		case download.StatusDone, download.StatusCancel:
-			doneN++
-		case download.StatusError:
-			// show with paused group in summary as "其它" folded into pausedN for compactness
-			pausedN++
-		default:
-			pausedN++
+	// section summary over every file in this level
+	runningN, queuedN, pausedN, errN, doneN, files := 0, 0, 0, 0, 0, 0
+	for _, r := range rows {
+		for _, s := range r.tasks {
+			files++
+			switch s.Status {
+			case download.StatusRunning, download.StatusFinalizing:
+				runningN++
+			case download.StatusQueued:
+				queuedN++
+			case download.StatusError:
+				errN++
+			case download.StatusDone, download.StatusCancel:
+				doneN++
+			default:
+				pausedN++
+			}
 		}
 	}
 	b.WriteString("\n")
-	summary := fmt.Sprintf("下载中 %d · 已暂停 %d · 已完成 %d · 共 %d · %s",
-		runningN, pausedN, doneN, len(list), dlRoot)
+	summary := fmt.Sprintf("下载中 %d · 失败 %d · 排队 %d · 已暂停 %d · 已完成 %d · 共 %d 个文件 · 第 %d/%d 项",
+		runningN, errN, queuedN, pausedN, doneN, files, cursor+1, len(rows))
 	b.WriteString(statusStyle.Width(max(1, m.width)).Render(truncate(summary, m.width-2)))
 	b.WriteString("\n")
-	b.WriteString(helpStyle.Render("↑↓ · 右键/m菜单 · p暂停 · r恢复 · x取消 · c清除已完成 · u检查更新 · esc/b返回"))
+	back := "esc/b返回网盘"
+	if len(m.dlPath) > 0 {
+		back = "esc/b返回上一层"
+	}
+	help := "↑↓/PgUp/PgDn · enter/双击打开文件夹 · " + back + " · 右键/m菜单 · p暂停 · r恢复 · x取消 · c清除已完成 · u检查更新"
+	b.WriteString(helpStyle.Render(truncate(help, max(20, m.width))))
 	return b.String()
 }
 
@@ -2441,36 +2518,7 @@ func (m model) renderDownloadItem(s download.Snapshot, focused bool, dlRoot stri
 	}
 	bar := progressBar(filled, barW, s.Status, hlBG)
 
-	stLabel := string(s.Status)
-	var stFG string
-	switch s.Status {
-	case download.StatusRunning:
-		stLabel = "下载中"
-		stFG = "39"
-	case download.StatusFinalizing:
-		stLabel = "收尾中"
-		stFG = "213" // pink/magenta spinner-ish
-	case download.StatusPausing:
-		stLabel = "暂停中"
-		stFG = "214"
-	case download.StatusQueued:
-		stLabel = "排队"
-		stFG = "117"
-	case download.StatusPaused:
-		stLabel = "已暂停"
-		stFG = "214"
-	case download.StatusDone:
-		stLabel = "完成"
-		stFG = "42"
-	case download.StatusError:
-		stLabel = "失败"
-		stFG = "196"
-	case download.StatusCancel:
-		stLabel = "取消"
-		stFG = "244"
-	default:
-		stFG = "252"
-	}
+	stLabel, stFG := dlStatusLabel(s.Status)
 	stStyle := withBG(lipgloss.NewStyle().Foreground(lipgloss.Color(stFG)).Bold(true), hlBG)
 
 	// filename keeps type color (green file / blue when done)
@@ -2566,32 +2614,7 @@ func (m model) renderDownloadItem(s download.Snapshot, focused bool, dlRoot stri
 	pathSt = withBG(pathSt, hlBG)
 	pathColored := pathSt.Render(pathLine)
 
-	lines := []string{nameLine, subLine, pathColored}
-
-	var out strings.Builder
-	for i, line := range lines {
-		if focused {
-			// accent + pad + content (all bg 237) + right fill
-			accent := lipgloss.NewStyle().
-				Foreground(lipgloss.Color("135")).
-				Background(lipgloss.Color(hlBG)).
-				Render("┃")
-			padL := lipgloss.NewStyle().Background(lipgloss.Color(hlBG)).Render("  ")
-			used := 1 + 2 + lipgloss.Width(line)
-			fillN := w - used
-			if fillN < 0 {
-				fillN = 0
-			}
-			padR := lipgloss.NewStyle().Background(lipgloss.Color(hlBG)).Render(strings.Repeat(" ", fillN))
-			out.WriteString(accent + padL + line + padR)
-		} else {
-			out.WriteString("   " + line)
-		}
-		if i < len(lines)-1 {
-			out.WriteString("\n")
-		}
-	}
-	return out.String()
+	return dlBlock([]string{nameLine, subLine, pathColored}, focused, w)
 }
 
 func (m model) renderRow(i int) string {

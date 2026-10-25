@@ -94,14 +94,20 @@ type PersistTask struct {
 	AutoPausedByQuit bool      `json:"auto_paused_by_quit,omitempty"`
 }
 
-// maxFinishedKeep caps completed/cancelled rows kept on disk (active always kept).
+// maxFinishedKeep caps the finished downloads kept on disk (active ones are
+// always kept). It counts downloads the way the download center shows them: a
+// folder download is one, however many files it holds. See trimHistory.
 const maxFinishedKeep = 200
 
-// maxLiveDownloads caps how many files are fetched at once. A recursive folder
-// download can queue hundreds, and each one opens its own set of range
-// connections; without a cap the drive end starts refusing them and every task
-// crawls. Per-file chunk concurrency is separate and unchanged.
-const maxLiveDownloads = 3
+// How many files are fetched at once. A recursive folder download can queue
+// hundreds, and each one opens its own set of range connections; without a cap
+// the drive end starts refusing them and every task crawls. The cap is set by
+// max_downloads in the config and bounded here. Per-file chunk concurrency is
+// separate (concurrency in the config).
+const (
+	defaultMaxLive = 3
+	maxLiveCap     = 10
+)
 
 // Manager tracks concurrent downloads for TUI + CLI.
 type Manager struct {
@@ -112,11 +118,17 @@ type Manager struct {
 	destDir   string
 	statePath string
 	loaded    bool
-	// live hands out the maxLiveDownloads file slots; a task parks on it until
-	// one is free.
-	live chan struct{}
+	// live hands out the file slots; a task parks on it until one is free.
+	live *slots
+	// saves counts the state writes still in flight. They run off the caller's
+	// goroutine, so without it nothing can tell when the state file has
+	// stopped changing.
+	saves sync.WaitGroup
 	// optional: re-resolve URL from fid on resume
 	ResolveURL func(fid string) (url string, total int64, err error)
+	// fetch fetches one file; nil means File. Tests swap in a stand-in so the
+	// queue, pause and resume logic runs without the network.
+	fetch func(ctx context.Context, c *client.Client, dlURL, dest string, opt Options) error
 }
 
 var (
@@ -138,7 +150,7 @@ func NewManager(c *client.Client, destDir string) *Manager {
 	if destDir == "" {
 		destDir = "downloads"
 	}
-	m := &Manager{client: c, destDir: destDir, live: make(chan struct{}, maxLiveDownloads)}
+	m := &Manager{client: c, destDir: destDir, live: newSlots(defaultMaxLive)}
 	m.statePath = defaultStatePath()
 	return m
 }
@@ -185,6 +197,20 @@ func (m *Manager) DestDir() string {
 	return m.destDir
 }
 
+// SetMaxLive sets how many files download at once, for the queue already
+// waiting too. 0 or less means the default (3); more than 10 is held at 10.
+// It returns the limit now in force.
+func (m *Manager) SetMaxLive(n int) int {
+	switch {
+	case n <= 0:
+		n = defaultMaxLive
+	case n > maxLiveCap:
+		n = maxLiveCap
+	}
+	m.live.setLimit(n)
+	return n
+}
+
 func (m *Manager) SetStatePath(p string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -199,6 +225,10 @@ type EnqueueOpts struct {
 	URL  string
 	Dest string
 	FID  string
+	// Size is the file size the listing reported, 0 if unknown. It seeds the
+	// task's total, so a folder in the download center can sum its files'
+	// sizes before the queued ones have started.
+	Size int64
 }
 
 // Enqueue starts a background download.
@@ -239,6 +269,7 @@ func (m *Manager) EnqueueEx(opt EnqueueOpts) (*Task, error) {
 		Dest:      dest,
 		FID:       opt.FID,
 		URL:       opt.URL,
+		Total:     max(opt.Size, 0),
 		Status:    StatusQueued,
 		CreatedAt: time.Now(),
 	}
@@ -288,12 +319,10 @@ func (m *Manager) run(cl *client.Client, t *Task, resume bool) {
 	// Park until one of the file slots frees up. m.mu must be released first:
 	// waiting with it held would freeze every other task, and the TUI with
 	// them, for as long as the queue is busy.
-	select {
-	case m.live <- struct{}{}:
-		defer func() { <-m.live }()
-	case <-ctx.Done():
+	if !m.live.acquire(ctx) {
 		return
 	}
+	defer m.live.release()
 
 	m.mu.Lock()
 	// Sitting in the queue is where a pause or a cancel is most likely to land,
@@ -310,7 +339,11 @@ func (m *Manager) run(cl *client.Client, t *Task, resume bool) {
 	fid := t.FID
 	dest := t.Dest
 	resolve := m.ResolveURL
+	fetch := m.fetch
 	m.mu.Unlock()
+	if fetch == nil {
+		fetch = File
+	}
 
 	// Resolve the link now, not at enqueue time: a CDN link handed out while
 	// the task waited its turn may already have expired.
@@ -339,7 +372,7 @@ func (m *Manager) run(cl *client.Client, t *Task, resume bool) {
 	}
 
 	// try download; on failure refresh CDN URL once and retry (common for small files)
-	err := File(ctx, cl, urlStr, dest, Options{
+	err := fetch(ctx, cl, urlStr, dest, Options{
 		Resume: resume,
 		OnProgress: func(done, total int64, speed float64) {
 			t.doneAt.Store(done)
@@ -362,7 +395,7 @@ func (m *Manager) run(cl *client.Client, t *Task, resume bool) {
 			m.mu.Lock()
 			t.URL = u
 			m.mu.Unlock()
-			err = File(ctx, cl, urlStr, dest, Options{
+			err = fetch(ctx, cl, urlStr, dest, Options{
 				Resume: true,
 				OnProgress: func(done, total int64, speed float64) {
 					t.doneAt.Store(done)
@@ -405,7 +438,11 @@ func (m *Manager) run(cl *client.Client, t *Task, resume bool) {
 			}
 			m.mu.Unlock()
 			// async persist so UI keeps spinning
-			go m.saveAsync()
+			m.saves.Add(1)
+			go func() {
+				defer m.saves.Done()
+				m.saveAsync()
+			}()
 			return
 		}
 		// shorten huge URL noise in UI: keep first line / host error only
@@ -491,6 +528,23 @@ func (m *Manager) PauseID(id string) bool {
 	return m.pauseMany(map[string]bool{id: true}, false) > 0
 }
 
+// PauseIDs signals pause on every listed task, e.g. all files of one folder,
+// and returns how many were pausable. Non-blocking, like PauseID.
+func (m *Manager) PauseIDs(ids []string) int {
+	if len(ids) == 0 {
+		return 0
+	}
+	return m.pauseMany(idSet(ids), false)
+}
+
+func idSet(ids []string) map[string]bool {
+	set := make(map[string]bool, len(ids))
+	for _, id := range ids {
+		set[id] = true
+	}
+	return set
+}
+
 // pauseMany marks matching tasks as Pausing and cancels them.
 // UI shows spinner on StatusPausing; background settles to StatusPaused.
 // wait=true blocks until workers finish (quit path only) and marks AutoPausedByQuit.
@@ -560,6 +614,15 @@ func (m *Manager) CancelID(id string) bool {
 	return m.cancelMany(map[string]bool{id: true}, false) > 0
 }
 
+// CancelIDs cancels every listed task that is still incomplete and returns
+// how many it cancelled. Non-blocking, like CancelID.
+func (m *Manager) CancelIDs(ids []string) int {
+	if len(ids) == 0 {
+		return 0
+	}
+	return m.cancelMany(idSet(ids), false)
+}
+
 // CancelAll cancels all incomplete tasks without blocking the caller.
 func (m *Manager) CancelAll() int {
 	return m.cancelMany(nil, false)
@@ -614,41 +677,45 @@ func (m *Manager) cancelMany(ids map[string]bool, wait bool) int {
 
 // ResumeID resumes one paused/error task.
 func (m *Manager) ResumeID(id string) bool {
+	return m.ResumeIDs([]string{id}) > 0
+}
+
+// ResumeIDs resumes every listed paused/error/cancelled task, e.g. all files
+// of one folder, and returns how many it restarted. They queue for the file
+// slots like any other task.
+func (m *Manager) ResumeIDs(ids []string) int {
+	want := idSet(ids)
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	cl := m.client
 	if cl == nil {
-		return false
+		return 0
 	}
-	var t *Task
-	for _, x := range m.tasks {
+	n := 0
+	for _, t := range m.tasks {
 		// allow retry on any error, and resume paused/incomplete
-		if x.ID != id {
+		if !want[t.ID] {
 			continue
 		}
-		switch x.Status {
+		switch t.Status {
 		case StatusPaused, StatusError, StatusCancel:
 			// ok
 		default:
 			continue
 		}
-		if x.running.Load() {
-			return false
+		if t.running.Load() {
+			continue
 		}
 		// CRITICAL: must leave StatusPaused before go run().
 		// run() aborts immediately if it still sees StatusPaused (pause-race guard).
-		x.Status = StatusQueued
-		x.Error = ""
-		x.Speed = 0
-		x.AutoPausedByQuit = false
-		t = x
-		break
+		t.Status = StatusQueued
+		t.Error = ""
+		t.Speed = 0
+		t.AutoPausedByQuit = false
+		m.launchLocked(cl, t, true)
+		n++
 	}
-	if t == nil {
-		return false
-	}
-	m.launchLocked(cl, t, true)
-	return true
+	return n
 }
 
 
@@ -660,6 +727,25 @@ func (m *Manager) AtDisplay(i int) *Snapshot {
 	}
 	s := list[i]
 	return &s
+}
+
+// LiveCount reports how many files are downloading right now (holding a
+// slot), how many wait for one, and the limit.
+func (m *Manager) LiveCount() (live, queued, limit int) {
+	m.mu.RLock()
+	for _, t := range m.tasks {
+		switch t.Status {
+		case StatusRunning, StatusFinalizing:
+			live++
+		case StatusQueued:
+			queued++
+		}
+	}
+	m.mu.RUnlock()
+	m.live.mu.Lock()
+	limit = m.live.limit
+	m.live.mu.Unlock()
+	return live, queued, limit
 }
 
 // ActiveCount returns running+queued+finalizing.
@@ -1162,7 +1248,9 @@ func (m *Manager) saveLocked() error {
 	}
 	// CRITICAL: never block UI/list under this lock with disk I/O.
 	// Callers hold m.mu; write async.
+	m.saves.Add(1)
 	go func(p string, data []byte) {
+		defer m.saves.Done()
 		_ = os.MkdirAll(filepath.Dir(p), 0o755)
 		_ = os.WriteFile(p, data, 0o600)
 	}(path, b)
@@ -1222,17 +1310,71 @@ func (m *Manager) marshalStateLocked() ([]byte, error) {
 			finished = append(finished, item)
 		}
 	}
-	// keep finished history (cap oldest)
-	if len(finished) > maxFinishedKeep {
-		sort.SliceStable(finished, func(i, j int) bool {
-			return finished[i].CreatedAt.Before(finished[j].CreatedAt)
-		})
-		finished = finished[len(finished)-maxFinishedKeep:]
-	}
+	finished = trimHistory(active, finished)
 	items := make([]PersistTask, 0, len(active)+len(finished))
 	items = append(items, active...)
 	items = append(items, finished...)
 	return json.MarshalIndent(items, "", "  ")
+}
+
+// historyGroup names the download a task belongs to: the top folder of a
+// folder download, or the task itself for a single file. The name is the
+// file's path under the download root, so the top folder is its destination
+// with all but the first component taken off.
+func historyGroup(it PersistTask) string {
+	parts := strings.FieldsFunc(it.Name, func(r rune) bool { return r == '/' || r == '\\' })
+	if len(parts) <= 1 || it.Dest == "" {
+		return "task:" + it.ID
+	}
+	dir := it.Dest
+	for range len(parts) - 1 {
+		dir = filepath.Dir(dir)
+	}
+	return "dir:" + dir
+}
+
+// trimHistory keeps the newest maxFinishedKeep finished downloads and drops
+// older ones whole: a folder is never cut down to part of its files. A folder
+// that still has an active file is always kept in full, or its finished files
+// would vanish from under it.
+func trimHistory(active, finished []PersistTask) []PersistTask {
+	live := map[string]bool{}
+	for _, it := range active {
+		live[historyGroup(it)] = true
+	}
+	newest := map[string]time.Time{}
+	for _, it := range finished {
+		g := historyGroup(it)
+		if t, ok := newest[g]; !ok || it.CreatedAt.After(t) {
+			newest[g] = it.CreatedAt
+		}
+	}
+	var groups []string
+	for g := range newest {
+		if !live[g] {
+			groups = append(groups, g)
+		}
+	}
+	if len(groups) <= maxFinishedKeep {
+		return finished
+	}
+	sort.Slice(groups, func(i, j int) bool {
+		if ti, tj := newest[groups[i]], newest[groups[j]]; !ti.Equal(tj) {
+			return ti.After(tj)
+		}
+		return groups[i] < groups[j]
+	})
+	keep := map[string]bool{}
+	for _, g := range groups[:maxFinishedKeep] {
+		keep[g] = true
+	}
+	out := make([]PersistTask, 0, len(finished))
+	for _, it := range finished {
+		if g := historyGroup(it); keep[g] || live[g] {
+			out = append(out, it)
+		}
+	}
+	return out
 }
 
 func snap(t *Task) Snapshot {

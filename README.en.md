@@ -15,7 +15,7 @@
 </p>
 
 <p align="center">
-  <img alt="version" src="https://img.shields.io/badge/version-1.0.6-blue">
+  <img alt="version" src="https://img.shields.io/badge/version-1.1.0-blue">
   <img alt="go" src="https://img.shields.io/badge/Go-1.26+-00ADD8?logo=go">
   <img alt="license" src="https://img.shields.io/badge/license-AGPL--3.0-blue">
   <img alt="platform" src="https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-lightgrey">
@@ -96,7 +96,7 @@ curl -fsSL https://raw.githubusercontent.com/ButterFuture/GoQuark/main/scripts/i
 Default path: `~/.local/bin/goquark` (or `/usr/local/bin` if writable). Options:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/ButterFuture/GoQuark/main/scripts/install.sh | bash -s -- --version v1.0.6
+curl -fsSL https://raw.githubusercontent.com/ButterFuture/GoQuark/main/scripts/install.sh | bash -s -- --version v1.1.0
 curl -fsSL https://raw.githubusercontent.com/ButterFuture/GoQuark/main/scripts/install.sh | bash -s -- --dir ~/.local/bin
 ```
 
@@ -108,8 +108,8 @@ curl -fsSL https://raw.githubusercontent.com/ButterFuture/GoQuark/main/scripts/i
 4. `chmod +x` and place it on your `PATH` as `goquark`
 
 ```bash
-chmod +x goquark_1.0.6_linux_amd64
-sudo mv goquark_1.0.6_linux_amd64 /usr/local/bin/goquark
+chmod +x goquark_1.1.0_linux_amd64
+sudo mv goquark_1.1.0_linux_amd64 /usr/local/bin/goquark
 ```
 
 After install, **start with the TUI**:
@@ -161,6 +161,7 @@ goquark version
 | Config | `~/.config/goquark/config.json` |
 | Override | `GOQUARK_CONFIG` or `-config` |
 | Default download dir | `~/Downloads/GoQuark` (`download_dir` / `GOQUARK_DOWNLOAD_DIR`) |
+| Files downloading at once | 3 by default, the rest queue; `max_downloads` in the config sets 1–10, MCP can change it too |
 
 Session cookies stay **local only**. Never commit or share a config that contains cookies.
 
@@ -178,7 +179,7 @@ Session cookies stay **local only**. Never commit or share a config that contain
 | `q` | Quit (confirms; safely pauses active jobs) |
 
 Files and folders can be picked together. The selected folder's own name, every subdirectory and the empty ones are kept, so picking `docs` saves to `<download dir>/docs/sub/file`.
-The download center lists one task per file, runs at most 3 files at a time and queues the rest; per-file chunk concurrency is unchanged. The CLI and MCP download entry points take files only.
+In the download center a downloaded folder takes one row with the progress of the whole folder; Enter or a double-click opens it level by level. Every level lists folders above files, each ordered downloading → failed → queued → paused → finished; a row whose status changes shows it in place and moves about 4 seconds later, and a paused row stays put. Folders downloaded with 1.0.6 that are still in the history are grouped too after the update. How many files download at once is `max_downloads` above; per-file chunk concurrency (`concurrency`) is a separate setting. The CLI and MCP download entry points take files only.
 
 ---
 
@@ -234,6 +235,7 @@ stdio server: host runs `goquark mcp` (**absolute path** required).
 | `goquark_download` | Download |
 | `goquark_downloads` | Task list |
 | `goquark_download_control` | Pause / resume / cancel |
+| `goquark_download_settings` | Read / change files downloading at once (`max_downloads`); saved to the config by default |
 | `goquark_check_update` | Check update |
 | `goquark_update` | Apply update (`apply=true`) |
 
@@ -245,7 +247,7 @@ stdio server: host runs `goquark mcp` (**absolute path** required).
 
 | Item | Detail |
 |------|--------|
-| Source of truth | Root [`VERSION`](VERSION) (currently **1.0.6**) |
+| Source of truth | Root [`VERSION`](VERSION) (currently **1.1.0**) |
 | Build inject | `scripts/build.sh` / CI via `-ldflags` |
 | Local `go run` | Shows `dev` if not injected |
 
@@ -255,7 +257,9 @@ stdio server: host runs `goquark mcp` (**absolute path** required).
 goquark version
 ```
 
-Release flow: ship features → bump `VERSION` → tag `v1.0.6` → CI / Release.
+Version numbers follow semver: a release with only fixes raises the last number (1.1.0 → 1.1.1), one that adds or changes features raises the middle one (1.1.x → 1.2.0), and the first is kept for breaking changes. Up to 1.0.6 every release raised the last number; 1.1.0 is where the rule starts.
+
+Release flow: ship features → bump `VERSION` → tag `v1.1.0` → CI / Release.
 
 ---
 

@@ -3,13 +3,74 @@
 All notable changes to GoQuark are documented in this file.
 
 Format loosely follows [Keep a Changelog](https://keepachangelog.com/).  
-Versioning follows the root [`VERSION`](../VERSION) file (semver).
+Versioning follows the root [`VERSION`](../VERSION) file (semver): a release
+with only fixes raises the patch number (1.1.0 → 1.1.1), one that adds or
+changes features raises the minor number (1.1.x → 1.2.0), and the major number
+is kept for changes that break existing setups.
 
 ## [Unreleased]
 
 ### Added
 
 ### Changed
+
+## [1.1.0] — 2026-10-25
+
+> **About the version number.** This release is 1.1.0, straight after 1.0.6.
+> It is not a major update. Up to 1.0.6 every release raised the last number,
+> fixes and features alike; from now on a release with only fixes raises the
+> last number (1.1.0 → 1.1.1) and one that adds or changes features raises the
+> middle one (1.1.x → 1.2.0). This one adds a feature, so it starts 1.1.
+>
+> **关于版本号：** 本次发布的版本号是 1.1.0，紧接 1.0.6。这不是大版本更新，只是规范了
+> 版本号：此前不论修复还是新功能都只加最后一位，从这一版起，只含修复的发布加最后一位
+> （1.1.0 → 1.1.1），加了或改了功能的发布加中间一位（1.1.x → 1.2.0）。本次带了一个新
+> 功能，所以从 1.1 开始。
+
+### Added
+- `max_downloads` in the config sets how many files download at once, 1 to
+  10 (default 3, as before); the rest queue. The download center's title shows
+  how many slots are in use and how many files wait for one
+- MCP tool `goquark_download_settings` reads or changes `max_downloads`. A
+  change applies to the running queue at once and is saved to the config
+  (`persist=false` keeps it to that session). `goquark_status` and
+  `goquark_downloads` report the limit too, and `goquark_downloads` how many
+  files are downloading and queued
+
+### Changed
+- The download center groups a folder download into one row instead of one
+  row per file. The row's bar covers the total size of everything underneath,
+  and it shows the combined speed, the time left, how many files are done and
+  how many failed. Enter, → or a double-click opens it, one level at a time;
+  Esc goes back up to the row it came from. Pause, resume and
+  cancel in its menu act on the whole folder; cancelling one asks first.
+  Queued files count with the size the drive listed, so the bar is right
+  before they start. Folders downloaded with 1.0.6 that are still in the
+  download history are grouped the same way after the update
+- The download center's order: on every level folders come first and files
+  below them, and each group runs downloading, failed, queued, paused,
+  finished. Rows of the same status keep newest first at the top level and go
+  by name inside a folder (Track 2 before Track 10). A row whose status
+  changes shows the new status where it is and moves about 4 seconds later,
+  rather than jumping away at once; a paused row stays where it was. The
+  cursor stays on its row when the row moves
+- The summary line counts downloading, failed, queued, paused and finished
+  files separately; queued files used to count as downloading
+
+### Fixed
+- The download center did not scroll (#1, reported by @sushl15). With more
+  tasks than fit, the terminal cut the overflow off the top and the
+  highlighted row went off screen with it. The list now draws only the rows
+  that fit and follows the cursor, PgUp/PgDn/Home/End move by page and to the
+  ends, and long names are cut instead of wrapping
+- A click in the download center selected the row above the one clicked
+- Several files or folders ticked in the drive were queued in random order;
+  they now queue in the order they are listed
+- The download history kept the newest 200 finished files, so after a
+  restart a folder of more than that showed only part of its files. It now
+  keeps the newest 200 downloads, a folder counting as one however many files
+  it holds, and drops older downloads whole; a folder with a file still
+  unfinished is always kept in full
 
 ## [1.0.6] — 2026-10-25
 

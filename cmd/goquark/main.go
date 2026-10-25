@@ -428,6 +428,7 @@ func cmdDownload(args []string) {
 
 	mgr := download.Global()
 	mgr.BindClient(c)
+	mgr.SetMaxLive(cfg.MaxDownloads)
 	mgr.SetDestDir(cfg.EffectiveDownloadDir())
 	name := filepath.Base(local)
 	task, _ := mgr.EnqueueEx(download.EnqueueOpts{
@@ -481,6 +482,7 @@ func cmdDownloads(args []string) {
 	c := client.New(cfg)
 	mgr := download.Global()
 	mgr.BindClient(c)
+	mgr.SetMaxLive(cfg.MaxDownloads)
 	mgr.SetDestDir(cfg.EffectiveDownloadDir())
 	// load history from disk (completed + incomplete)
 	_, _ = mgr.LoadPersisted()

@@ -15,7 +15,7 @@
 </p>
 
 <p align="center">
-  <img alt="version" src="https://img.shields.io/badge/version-1.0.6-blue">
+  <img alt="version" src="https://img.shields.io/badge/version-1.1.0-blue">
   <img alt="go" src="https://img.shields.io/badge/Go-1.26+-00ADD8?logo=go">
   <img alt="license" src="https://img.shields.io/badge/license-AGPL--3.0-blue">
   <img alt="platform" src="https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-lightgrey">
@@ -97,7 +97,7 @@ curl -fsSL https://raw.githubusercontent.com/ButterFuture/GoQuark/main/scripts/i
 
 ```bash
 # 指定版本 / 目录
-curl -fsSL https://raw.githubusercontent.com/ButterFuture/GoQuark/main/scripts/install.sh | bash -s -- --version v1.0.6
+curl -fsSL https://raw.githubusercontent.com/ButterFuture/GoQuark/main/scripts/install.sh | bash -s -- --version v1.1.0
 curl -fsSL https://raw.githubusercontent.com/ButterFuture/GoQuark/main/scripts/install.sh | bash -s -- --dir ~/.local/bin
 ```
 
@@ -113,8 +113,8 @@ curl -fsSL https://raw.githubusercontent.com/ButterFuture/GoQuark/main/scripts/i
 4. `chmod +x goquark_*` 后移到 `PATH` 中，并重命名为 `goquark`
 
 ```bash
-chmod +x goquark_1.0.6_linux_amd64
-sudo mv goquark_1.0.6_linux_amd64 /usr/local/bin/goquark
+chmod +x goquark_1.1.0_linux_amd64
+sudo mv goquark_1.1.0_linux_amd64 /usr/local/bin/goquark
 ```
 
 安装完成后，**推荐直接启动 TUI**：
@@ -166,6 +166,7 @@ goquark version
 | 配置文件 | `~/.config/goquark/config.json` |
 | 覆盖方式 | 环境变量 `GOQUARK_CONFIG` 或参数 `-config` |
 | 默认下载目录 | `~/Downloads/GoQuark`（可用 `download_dir` / `GOQUARK_DOWNLOAD_DIR`） |
+| 同时下载文件数 | 默认 3，其余排队；配置文件里的 `max_downloads` 可改为 1–10，MCP 也可修改 |
 
 登录态与 Cookie **仅保存在本机**。请勿把含 Cookie 的配置提交到 Git 或发给他人。
 
@@ -183,7 +184,7 @@ goquark version
 | `q` | 退出（确认后安全暂停进行中的任务） |
 
 文件与文件夹可以混选。所选文件夹的名称、各级子目录和空文件夹都会保留，选中 `资料` 后保存为 `下载目录/资料/子目录/文件`。
-下载中心按文件列任务，同时最多下载 3 个文件、其余排队，单个文件的分块并发设置不变。CLI 与 MCP 的下载入口目前只接受文件。
+下载中心里，一次下载的文件夹只占一行，显示整个文件夹的进度，回车或双击可逐层展开。每一层都是文件夹在上、文件在下，各自按 下载中 → 失败 → 排队 → 已暂停 → 已完成 排列；状态变化后先原地显示，约 4 秒后再移到新位置，暂停的任务留在原处。1.0.6 下载、仍在历史记录里的文件夹，升级后同样按文件夹显示。同时下载的文件数见上表的 `max_downloads`，单个文件的分块并发（`concurrency`）是另一项设置。CLI 与 MCP 的下载入口目前只接受文件。
 
 ---
 
@@ -239,6 +240,7 @@ goquark version
 | `goquark_download` | 下载 |
 | `goquark_downloads` | 下载任务列表 |
 | `goquark_download_control` | 暂停 / 恢复 / 取消 |
+| `goquark_download_settings` | 查看 / 修改同时下载文件数（`max_downloads`），默认写入配置 |
 | `goquark_check_update` | 检查更新 |
 | `goquark_update` | 应用更新（`apply=true`） |
 
@@ -250,7 +252,7 @@ goquark version
 
 | 项目 | 说明 |
 |------|------|
-| 唯一来源 | 仓库根目录 [`VERSION`](VERSION)（当前 **1.0.6**） |
+| 唯一来源 | 仓库根目录 [`VERSION`](VERSION)（当前 **1.1.0**） |
 | 构建注入 | `scripts/build.sh` / CI 通过 `-ldflags` 写入二进制 |
 | 本地 `go run` | 未注入时显示 `dev` |
 
@@ -260,7 +262,9 @@ goquark version
 goquark version        # 查看已注入版本
 ```
 
-发版建议：改功能 → 确认 → 更新 `VERSION` → 打 tag `v1.0.6` → CI / Release。
+版本号遵循语义化版本：只含修复的发布加最后一位（1.1.0 → 1.1.1），加了或改了功能的发布加中间一位（1.1.x → 1.2.0），第一位留给不兼容的改动。1.0.6 之前每次发布都只加最后一位，从 1.1.0 起按这个规则走。
+
+发版建议：改功能 → 确认 → 更新 `VERSION` → 打 tag `v1.1.0` → CI / Release。
 
 ---
 
