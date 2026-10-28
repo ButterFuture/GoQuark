@@ -116,7 +116,7 @@ func usage() {
 	fmt.Print(`GoQuark — Quark drive login & high-speed download
 
 Usage:
-  goquark login [--config PATH] [--nickname NAME] [--token-only]
+  goquark login [--config PATH] [--nickname NAME] [--token-only] [--wechat]
   goquark device [--config PATH] [--json]
   goquark whoami [--config PATH] [--json]
   goquark ls [PATH] [--config PATH] [--json]
@@ -188,6 +188,7 @@ func cmdLogin(args []string) {
 	cfgPath := fs.String("config", config.DefaultPath(), "config path")
 	nick := fs.String("nickname", "", "device display name override")
 	tokenOnly := fs.Bool("token-only", false, "only emit QR")
+	wechat := fs.Bool("wechat", false, "log in by scanning with WeChat instead of the Quark app")
 	_ = fs.Parse(args)
 	cfg, err := config.Load(*cfgPath)
 	if err != nil {
@@ -199,7 +200,11 @@ func cmdLogin(args []string) {
 	fmt.Printf("device: %s | %s | %s | id=%s\n",
 		cfg.Device.DeviceName, cfg.Device.Model, cfg.Device.Platform, cfg.Device.MachineID)
 
-	res, err := auth.LoginQR(cfg, auth.Options{
+	login := auth.LoginQR
+	if *wechat {
+		login = auth.LoginWeChat
+	}
+	res, err := login(cfg, auth.Options{
 		TokenOnly:  *tokenOnly,
 		PrintASCII: true,
 		OnStatus: func(msg string) {

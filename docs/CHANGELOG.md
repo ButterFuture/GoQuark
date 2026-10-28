@@ -11,6 +11,11 @@ is kept for changes that break existing setups.
 ## [Unreleased]
 
 ### Added
+- `goquark login --wechat` logs in by scanning a QR code with WeChat instead
+  of the Quark app, the same flow as pan.quark.cn's WeChat login. A WeChat
+  account not yet linked to a Quark account with a phone number gets a clear
+  error (code 50022) instead of a phone-binding prompt. CLI only for now; the
+  TUI login screen and the MCP login tools still use the Quark-app QR
 
 ### Changed
 

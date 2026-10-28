@@ -29,7 +29,7 @@ GoQuark 是用 **Go** 写的夸克网盘客户端，面向命令行与自动化�
 
 | 场景 | 能力 |
 |------|------|
-| 登录 | 夸克 APP **扫码登录** |
+| 登录 | 夸克 APP **扫码登录**，或微信扫码（`--wechat`） |
 | 下载 | **贴近真实客户端** 的下载速度；队列、暂停/继续、进度与 ETA |
 | 浏览 | 终端 **TUI**：点选、多选、右键菜单、下载中心 |
 | 脚本 | CLI + 管道 / `--json` 输出 |
@@ -149,6 +149,7 @@ goquark tui
 
 ```bash
 goquark login          # 扫码登录（终端出码 + qrcode.png）
+goquark login --wechat # 改用微信扫码登录
 goquark device         # 设备信息
 goquark whoami         # 当前用户
 goquark ls /           # 列目录
