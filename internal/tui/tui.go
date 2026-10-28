@@ -15,6 +15,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 
@@ -23,6 +24,7 @@ import (
 	"github.com/ButterFuture/GoQuark/internal/client"
 	"github.com/ButterFuture/GoQuark/internal/config"
 	"github.com/ButterFuture/GoQuark/internal/device"
+	"github.com/ButterFuture/GoQuark/internal/dlsvc"
 	"github.com/ButterFuture/GoQuark/internal/download"
 	"github.com/ButterFuture/GoQuark/internal/update"
 	"github.com/charmbracelet/bubbles/spinner"
@@ -156,7 +158,7 @@ type model struct {
 	// centered modal
 	modalTitle string
 	modalBody  string
-	modalKind  string // "error" | "info" | "confirm"
+	modalKind  string // "error" | "info" | "confirm" | "progress" | "help"
 	modalBack  mode   // mode to restore on close
 	// confirm action id when modalKind=="confirm"
 	confirmAction string
@@ -190,7 +192,7 @@ type model struct {
 	// download
 	dlBusy bool
 	dlMsg  string
-	dlMgr  *download.Manager
+	dlMgr  download.Controller
 	// scan is the folder expansion running behind the browse view. gen rises
 	// with every new scan, so a result that arrives from one already cancelled
 	// can be told apart and dropped.
@@ -235,6 +237,37 @@ type model struct {
 	loginQRPath string
 	loginQRURL  string
 	loginQRArt  string // terminal ASCII QR
+	loginMethod auth.Method
+	loginCtl    *loginControl
+	loggingOut  bool
+	// quit dialog: remember the choice (下次不再询问), checked by default
+	quitRemember bool
+}
+
+// loginControl is shared by every copy of the model, so starting a login can
+// cancel the one still polling and the old pump can tell it is stale.
+type loginControl struct {
+	mu     sync.Mutex
+	gen    int
+	cancel context.CancelFunc
+}
+
+func (c *loginControl) begin() (context.Context, int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.cancel != nil {
+		c.cancel()
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	c.cancel = cancel
+	c.gen++
+	return ctx, c.gen
+}
+
+func (c *loginControl) current(gen int) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return gen == c.gen
 }
 
 type loadedMsg struct {
@@ -298,6 +331,16 @@ type Options struct {
 // keyLetter normalizes a single a-z/A-Z key to lowercase so bindings are
 // case-insensitive. Non-letter keys (enter, ctrl+c, f10, …) pass through.
 func keyLetter(s string) string {
+	// A Chinese input method types full-width forms (？ ｄ　): fold them to
+	// ASCII so ? and the letter keys work without switching to English.
+	if r := []rune(s); len(r) == 1 {
+		switch {
+		case r[0] >= 0xFF01 && r[0] <= 0xFF5E:
+			s = string(r[0] - 0xFEE0)
+		case r[0] == 0x3000:
+			s = " "
+		}
+	}
 	if len(s) == 1 {
 		c := s[0]
 		if c >= 'A' && c <= 'Z' {
@@ -316,31 +359,30 @@ func Run(cfg *config.Config, opts Options) error {
 	sp.Spinner = spinner.Dot
 	sp.Style = lipgloss.NewStyle().Foreground(lipgloss.Color("12"))
 
-	mgr := download.Global()
-	mgr.BindClient(c)
+	// Downloads run in the download service shared by every GoQuark process
+	// of this config; it holds the session, the queue and downloads.json.
+	mgr := dlsvc.Open(cfg.Path())
 	mgr.SetMaxLive(cfg.MaxDownloads)
 	dlDir := cfg.EffectiveDownloadDir()
 	_ = os.MkdirAll(dlDir, 0o755)
 	mgr.SetDestDir(dlDir)
-	// CDN URL expires — re-resolve via fid on resume
-	mgr.ResolveURL = func(fid string) (string, int64, error) {
-		return api.GetDownloadURL(c, fid)
-	}
-	_, _ = mgr.LoadPersisted()
 
 	ver := opts.Version
 	if ver == "" {
 		ver = "dev"
 	}
 	m := model{
-		cfg:         cfg,
-		client:      c,
-		spinner:     sp,
-		stack:       []navFrame{{fid: "0", path: "/", name: "根目录"}},
-		selected:    map[int]bool{},
-		loginQRPath: filepath.Join(filepath.Dir(cfg.Path()), "qrcode.png"),
-		dlMgr:       mgr,
-		appVersion:  ver,
+		cfg:          cfg,
+		client:       c,
+		spinner:      sp,
+		stack:        []navFrame{{fid: "0", path: "/", name: "根目录"}},
+		selected:     map[int]bool{},
+		loginQRPath:  filepath.Join(filepath.Dir(cfg.Path()), "qrcode.png"),
+		loginMethod:  auth.MethodQuark,
+		loginCtl:     &loginControl{},
+		quitRemember: true,
+		dlMgr:        mgr,
+		appVersion:   ver,
 	}
 	if err := cfg.RequireLogin(); err != nil {
 		m.mode = modeLogin
@@ -421,15 +463,20 @@ func (m model) loadCurrent() tea.Cmd {
 	}
 }
 
+// startLogin starts a QR login with the selected method, cancelling any
+// login still in progress.
 func (m model) startLogin() tea.Cmd {
 	cfg := m.cfg
 	qrPath := m.loginQRPath
+	method := m.loginMethod
+	ctx, gen := m.loginCtl.begin()
 	return func() tea.Msg {
 		statusCh := make(chan string, 32)
 		doneCh := make(chan error, 1)
 		qrCh := make(chan qrReadyMsg, 1)
 		go func() {
-			_, err := auth.LoginQR(cfg, auth.Options{
+			_, err := auth.Login(cfg, method, auth.Options{
+				Ctx:        ctx,
 				QRPngPath:  qrPath,
 				QRURLPath:  filepath.Join(filepath.Dir(qrPath), "qrcode.url.txt"),
 				PrintASCII: false,
@@ -450,7 +497,7 @@ func (m model) startLogin() tea.Cmd {
 			})
 			doneCh <- err
 		}()
-		return loginPumpMsg{statusCh: statusCh, doneCh: doneCh, qrCh: qrCh}
+		return loginPumpMsg{loginPump{gen: gen, statusCh: statusCh, doneCh: doneCh, qrCh: qrCh}}
 	}
 }
 
@@ -459,21 +506,28 @@ type qrReadyMsg struct {
 	ascii string
 }
 
-type loginPumpMsg struct {
+// loginPump carries one login's channels; gen tells a cancelled login apart.
+type loginPump struct {
+	gen      int
 	statusCh <-chan string
 	doneCh   <-chan error
 	qrCh     <-chan qrReadyMsg
 }
-type loginPumpTick struct {
-	statusCh <-chan string
-	doneCh   <-chan error
-	qrCh     <-chan qrReadyMsg
+type loginPumpMsg struct{ loginPump }
+type loginPumpTick struct{ loginPump }
+
+func pollLogin(p loginPump) tea.Cmd {
+	return func() tea.Msg {
+		return loginPumpTick{p}
+	}
 }
 
-func pollLogin(statusCh <-chan string, doneCh <-chan error, qrCh <-chan qrReadyMsg) tea.Cmd {
-	return func() tea.Msg {
-		return loginPumpTick{statusCh: statusCh, doneCh: doneCh, qrCh: qrCh}
+// scanPrompt is the login status once the QR is up.
+func (m model) scanPrompt() string {
+	if m.loginMethod == auth.MethodWeChat {
+		return "请使用微信扫码"
 	}
+	return "请使用夸克 APP 扫码"
 }
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -523,22 +577,37 @@ func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, cmd
 
+	case logoutDoneMsg:
+		return m.finishLogout(msg.err, msg.paused)
+
 	case loginPumpMsg:
+		if !m.loginCtl.current(msg.gen) {
+			return m, nil
+		}
 		m.loginBusy = true
 		m.loginStatus = "正在获取二维码…"
 		m.loginQRArt = ""
 		m.loginQRURL = ""
-		return m, pollLogin(msg.statusCh, msg.doneCh, msg.qrCh)
+		return m, pollLogin(msg.loginPump)
 
 	case loginPumpTick:
+		if !m.loginCtl.current(msg.gen) {
+			return m, nil // superseded by a newer login
+		}
 		select {
 		case err := <-msg.doneCh:
 			m.loginBusy = false
+			if errors.Is(err, context.Canceled) {
+				return m, nil
+			}
 			if err != nil {
 				return m.showModal("登录失败", err.Error(), "error", modeLogin), nil
 			}
 			m.mode = modeBrowse
 			m.client = client.New(m.cfg)
+			if m.dlMgr != nil {
+				m.dlMgr.ReloadSession()
+			}
 			m.loading = true
 			m.status = "登录成功，加载目录…"
 			m.stack = []navFrame{{fid: "0", path: "/", name: "根目录"}}
@@ -548,8 +617,8 @@ func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case qr := <-msg.qrCh:
 			m.loginQRURL = qr.url
 			m.loginQRArt = qr.ascii
-			m.loginStatus = "请使用夸克 APP 扫码"
-			return m, pollLogin(msg.statusCh, msg.doneCh, msg.qrCh)
+			m.loginStatus = m.scanPrompt()
+			return m, pollLogin(msg.loginPump)
 		case s := <-msg.statusCh:
 			switch {
 			case s == "waiting_scan":
@@ -560,8 +629,12 @@ func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 			case strings.Contains(s, "qr ready"):
 				if m.loginStatus == "" || m.loginStatus == "正在获取二维码…" {
-					m.loginStatus = "请使用夸克 APP 扫码"
+					m.loginStatus = m.scanPrompt()
 				}
+			case s == "scanned":
+				m.loginStatus = "已扫码，请在微信里确认…"
+			case s == "cancelled":
+				m.loginStatus = "已在微信里取消，可重新扫码"
 			case strings.HasPrefix(s, "poll err:"):
 				// keep quiet-ish; show short status
 				m.loginStatus = "网络波动，重试中…"
@@ -572,10 +645,10 @@ func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.loginStatus = s
 				}
 			}
-			return m, pollLogin(msg.statusCh, msg.doneCh, msg.qrCh)
+			return m, pollLogin(msg.loginPump)
 		default:
 			return m, tea.Tick(120*time.Millisecond, func(time.Time) tea.Msg {
-				return loginPumpTick{statusCh: msg.statusCh, doneCh: msg.doneCh, qrCh: msg.qrCh}
+				return loginPumpTick{msg.loginPump}
 			})
 		}
 
@@ -613,7 +686,7 @@ func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.mode = modeLogin
 				m.client = client.New(m.cfg)
 				if m.dlMgr != nil {
-					m.dlMgr.BindClient(m.client)
+					m.dlMgr.ReloadSession()
 				}
 				m.loginStatus = "登录已失效，请重新扫码"
 				return m.showModal("需要重新登录", msg.err.Error(), "error", modeLogin), m.startLogin()
@@ -659,18 +732,14 @@ func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.mode = modeLogin
 				m.client = client.New(m.cfg)
 				if m.dlMgr != nil {
-					m.dlMgr.BindClient(m.client)
-					m.dlMgr.ResolveURL = func(fid string) (string, int64, error) {
-						return api.GetDownloadURL(m.client, fid)
-					}
+					m.dlMgr.ReloadSession()
 				}
 				return m.showModal("需要重新登录", msg.err.Error(), "error", modeLogin), m.startLogin()
 			}
 			return m.showModal("下载失败", msg.err.Error(), "error", modeBrowse), nil
 		}
 		if m.dlMgr == nil {
-			m.dlMgr = download.Global()
-			m.dlMgr.BindClient(m.client)
+			m.dlMgr = dlsvc.Open(m.cfg.Path())
 			m.dlMgr.SetDestDir(m.cfg.EffectiveDownloadDir())
 		}
 		// queue conflicts for sequential prompts
@@ -686,14 +755,14 @@ func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				_ = os.Remove(j.dest)
 				_ = os.Remove(j.dest + ".gqparts")
 			}
-			t, err := m.dlMgr.EnqueueEx(download.EnqueueOpts{
+			id, err := m.dlMgr.Add(download.EnqueueOpts{
 				Name: j.name, URL: j.url, Dest: j.dest, FID: j.fid, Size: j.size,
 			})
 			if err != nil {
 				return m.showModal("下载失败", err.Error(), "error", modeBrowse), nil
 			}
-			if t != nil {
-				lastID = t.ID
+			if id != "" {
+				lastID = id
 			}
 		}
 		m.mode = modeDownloads
@@ -794,6 +863,9 @@ func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			ver = msg.res.Latest
 		}
 		done := "已安装 " + ver + "\n请退出后重新启动 GoQuark。"
+		if note := m.updateNote(); note != "" {
+			done += "\n" + note
+		}
 		if msg.res != nil && msg.res.PendingCleanup != "" {
 			// Windows keeps the old image locked while this process runs it.
 			done += "\n旧版本文件会在下次启动时自动清理。"
@@ -928,6 +1000,8 @@ func (m model) confirmLabels() (okLabel, noLabel string) {
 	case "update_disable_auto":
 		// Default = keep auto-check ON (user asked: 默认保持开启)
 		okLabel, noLabel = "保持开启", "关闭自动检查"
+	case "quit_choice":
+		okLabel, noLabel = "暂停下载并退出", "后台继续下载"
 	}
 	return okLabel, noLabel
 }
@@ -953,6 +1027,13 @@ func (m model) activateConfirmBtn(which int) (tea.Model, tea.Cmd) {
 	act := m.confirmAction
 	m.btnHover = 0
 	m.btnFocus = 1
+	if act == "quit_choice" {
+		m.confirmAction = ""
+		if which == 2 {
+			return m.chooseQuit(quitBackground)
+		}
+		return m.chooseQuit(quitPause)
+	}
 	if which == 2 {
 		// secondary
 		m.confirmAction = ""
@@ -1077,6 +1158,12 @@ func (m model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 				if m.notesToggleHit(msg.X, msg.Y) {
 					if msg.Action == tea.MouseActionRelease {
 						return m.toggleUpdateNotes(), nil
+					}
+					return m, nil
+				}
+				if m.quitRememberHit(msg.X, msg.Y) {
+					if msg.Action == tea.MouseActionRelease {
+						return m.toggleQuitRemember(), nil
 					}
 					return m, nil
 				}
@@ -1261,6 +1348,26 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if m.quitting {
 			return m, nil
 		}
+		if m.modalKind == "confirm" && m.confirmAction == "quit_choice" {
+			switch key {
+			case " ":
+				return m.toggleQuitRemember(), nil
+			case "esc", "q", "n":
+				// the dialog's own way out: stay, nothing paused
+				m.mode = m.modalBack
+				m.confirmAction = ""
+				return m, nil
+			}
+		}
+		if m.modalKind == "help" {
+			m.mode = m.modalBack
+			switch key {
+			case "?", "esc", "enter":
+				return m, nil
+			}
+			// any other key is the shortcut it shows: run it on the view below
+			return m.handleKey(msg)
+		}
 		if m.modalKind == "progress" {
 			// Only an explicit abort does anything; a stray Enter must not
 			// throw away a download that is half done.
@@ -1344,6 +1451,16 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.loginStatus = "正在获取二维码…"
 				return m, m.startLogin()
 			}
+		case "tab":
+			if m.loginMethod == auth.MethodWeChat {
+				m.loginMethod = auth.MethodQuark
+			} else {
+				m.loginMethod = auth.MethodWeChat
+			}
+			m.loginQRArt = ""
+			m.loginQRURL = ""
+			m.loginStatus = "正在获取二维码…"
+			return m, m.startLogin()
 		}
 		return m, nil
 	case modeProfile:
@@ -1370,9 +1487,9 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		case "q":
 			// dangerous: confirm quit
 			m.mode = modeBrowse
-			return m.showConfirm("退出程序", "确定要退出 GoQuark 吗？", "quit"), nil
+			return m.askQuit(), nil
 		case "ctrl+c":
-			return m.showConfirm("退出程序", "确定要退出 GoQuark 吗？", "quit"), nil
+			return m.askQuit(), nil
 		case "up", "k":
 			if m.menuIdx > 0 {
 				m.menuIdx--
@@ -1401,10 +1518,12 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			if rows := m.dlRows(); m.dlCursor >= 0 && m.dlCursor < len(rows) && rows[m.dlCursor].dir {
 				m.dlOpenFolder(rows[m.dlCursor])
 			}
+		case "?":
+			return m.showShortcuts(), nil
 		case "q":
-			return m.showConfirm("退出程序", "确定要退出 GoQuark 吗？", "quit"), nil
+			return m.askQuit(), nil
 		case "ctrl+c":
-			return m.showConfirm("退出程序", "确定要退出 GoQuark 吗？", "quit"), nil
+			return m.askQuit(), nil
 		case "up", "k":
 			m.dlCursor--
 		case "down", "j":
@@ -1450,9 +1569,9 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.status = "正在检查更新…"
 		return m, m.cmdCheckUpdate(true)
 	case "q":
-		return m.showConfirm("退出程序", "确定要退出 GoQuark 吗？", "quit"), nil
+		return m.askQuit(), nil
 	case "ctrl+c":
-		return m.showConfirm("退出程序", "确定要退出 GoQuark 吗？", "quit"), nil
+		return m.askQuit(), nil
 	case "up", "k":
 		if m.cursor > 0 {
 			m.cursor--
@@ -1522,6 +1641,8 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, m.fetchProfile()
 	case "o":
 		return m.showConfirm("退出登录", "确定退出当前账号？设备信息会保留。", "logout"), nil
+	case "?":
+		return m.showShortcuts(), nil
 	}
 	return m, nil
 }
@@ -1701,7 +1822,7 @@ func (m model) applyMenu(id string) (tea.Model, tea.Cmd) {
 	case "logout":
 		return m.showConfirm("退出登录", "确定退出当前账号？设备信息会保留。", "logout"), nil
 	case "quit":
-		return m.showConfirm("退出程序", "确定要退出 GoQuark 吗？", "quit"), nil
+		return m.askQuit(), nil
 	// download-center menu
 	case "dl_open":
 		m.mode = modeDownloads
@@ -1884,8 +2005,7 @@ func (m model) resolveConflict(replace bool) (tea.Model, tea.Cmd) {
 		dest = download.UniqueDest(dest)
 	}
 	if m.dlMgr == nil {
-		m.dlMgr = download.Global()
-		m.dlMgr.BindClient(m.client)
+		m.dlMgr = dlsvc.Open(m.cfg.Path())
 		m.dlMgr.SetDestDir(m.cfg.EffectiveDownloadDir())
 	}
 	// need URL — if empty, resolve async
@@ -1911,7 +2031,7 @@ func (m model) resolveConflict(replace bool) (tea.Model, tea.Cmd) {
 // Wait runs in a tea.Cmd (background), TUI keeps spinning until done.
 func (m model) beginQuit() (tea.Model, tea.Cmd) {
 	m.stopScan()
-	if m.dlMgr == nil || m.dlMgr.ActiveCount() == 0 {
+	if m.dlMgr == nil || m.dlMgr.ActiveCount() == 0 || m.quitPref() == quitBackground {
 		return m, tea.Quit
 	}
 	m.quitting = true
@@ -1930,6 +2050,14 @@ func (m model) beginQuit() (tea.Model, tea.Cmd) {
 			return pauseDoneMsg{}
 		},
 	)
+}
+
+// updateNote is what a just-installed update means for running downloads.
+func (m model) updateNote() string {
+	if m.cfg == nil {
+		return ""
+	}
+	return dlsvc.UpdateNote(m.cfg.Path())
 }
 
 func (m model) fetchProfile() tea.Cmd {
@@ -1953,16 +2081,49 @@ func (m model) fetchProfile() tea.Cmd {
 	}
 }
 
+// logoutDoneMsg reports the server half of a logout.
+type logoutDoneMsg struct {
+	err    error
+	paused int // downloads paused when the logout began
+}
+
+// doLogout pauses the downloads, which need the session, and ends the session
+// on the server first, like the PC client; the local cleanup in finishLogout
+// runs when that returns, success or not.
 func (m model) doLogout() (tea.Model, tea.Cmd) {
+	if m.loggingOut {
+		return m, nil
+	}
+	m.loggingOut = true
+	m.status = "正在退出登录…"
+	paused := 0
+	if m.dlMgr != nil {
+		paused = m.dlMgr.PauseAll()
+	}
+	cl := m.client
+	return m, func() tea.Msg { return logoutDoneMsg{err: api.Logout(cl), paused: paused} }
+}
+
+func (m model) finishLogout(serverErr error, paused int) (tea.Model, tea.Cmd) {
+	m.loggingOut = false
 	m.stopScan()
 	m.cfg.ClearSession()
 	_ = m.cfg.Save()
+	if m.dlMgr != nil {
+		m.dlMgr.ReloadSession()
+	}
 	m.mode = modeLogin
 	m.client = client.New(m.cfg)
 	m.rows = nil
 	m.selected = map[int]bool{}
 	m.status = "已退出登录"
 	m.loginStatus = "按 l 开始扫码登录"
+	if serverErr != nil {
+		m.loginStatus = "已退出登录，但服务端未确认（会话可能仍有效）· 按 l 扫码登录"
+	}
+	if paused > 0 {
+		m.loginStatus = fmt.Sprintf("已暂停 %d 个下载 · ", paused) + m.loginStatus
+	}
 	m.loginBusy = false
 	m.dlMsg = ""
 	return m, nil
@@ -2068,15 +2229,11 @@ func (m model) doDownload() (tea.Model, tea.Cmd) {
 	// always refresh dest dir from config (user may have changed download_dir)
 	destDir := m.cfg.EffectiveDownloadDir()
 	if m.dlMgr == nil {
-		m.dlMgr = download.Global()
-		m.dlMgr.BindClient(m.client)
+		m.dlMgr = dlsvc.Open(m.cfg.Path())
 	}
 	cl := m.client
-	// Jobs carry a FID and no link, so the manager needs to be able to fetch
-	// one when a job reaches the front of the queue.
-	m.dlMgr.ResolveURL = func(fid string) (string, int64, error) {
-		return api.GetDownloadURL(cl, fid)
-	}
+	// Jobs carry a FID and no link; the download service fetches one with its
+	// own session when a job reaches the front of the queue.
 	m.dlMgr.SetDestDir(destDir)
 	mgr := m.dlMgr
 	ctx, cancel := context.WithCancel(context.Background())
@@ -2095,7 +2252,7 @@ func (m model) doDownload() (tea.Model, tea.Cmd) {
 // Anything that is not a plain file is refused rather than opened: following a
 // symlink here would write wherever it points, and the name it was built from
 // came from the drive.
-func destUnavailable(mgr *download.Manager, dest, fid string) error {
+func destUnavailable(mgr download.Controller, dest, fid string) error {
 	if busy := mgr.BusyAtDest(dest); busy != nil && busy.FID != fid {
 		return fmt.Errorf("目标路径已有其他文件的下载任务：%s", dest)
 	}
@@ -2115,7 +2272,7 @@ func destUnavailable(mgr *download.Manager, dest, fid string) error {
 // planDownloads expands the selection and then decides, file by file, whether
 // to queue it, skip it, or put the choice to the user. It runs on a tea.Cmd
 // goroutine, so it touches no model state.
-func planDownloads(ctx context.Context, cl *client.Client, mgr *download.Manager, destDir string, sel []api.FileEntry) dlEnqueueMsg {
+func planDownloads(ctx context.Context, cl *client.Client, mgr download.Controller, destDir string, sel []api.FileEntry) dlEnqueueMsg {
 	tree, err := download.Expand(ctx, sel, func(fid string, page, size int) ([]api.FileEntry, error) {
 		return api.ListDir(cl, fid, page, size)
 	})
@@ -2347,9 +2504,8 @@ func (m model) viewBrowse() string {
 	}
 	b.WriteString(statusStyle.Width(max(1, m.width)).Render(truncate(foot, m.width-2)))
 	b.WriteString("\n")
-	// always show shortcuts help (truncate only if terminal is tiny)
-	help := "单击选中 · 空格多选 · a全选 · c清除 · 双击/enter打开 · 右键/m菜单 · d下载 · t下载中心 · u检查更新 · i信息 · o退出登录 · q退出"
-	b.WriteString(helpStyle.Render(truncate(help, max(20, m.width))))
+	// as many shortcuts as fit, then "?全部快捷键" for the rest
+	b.WriteString(helpStyle.Render(hintLine(browseHints, max(20, m.width))))
 	return b.String()
 }
 
@@ -2430,12 +2586,12 @@ func (m model) viewDownloads() string {
 		runningN, errN, queuedN, pausedN, doneN, files, cursor+1, len(rows))
 	b.WriteString(statusStyle.Width(max(1, m.width)).Render(truncate(summary, m.width-2)))
 	b.WriteString("\n")
-	back := "esc/b返回网盘"
+	back := keyHint{"esc/b", "返回网盘"}
 	if len(m.dlPath) > 0 {
-		back = "esc/b返回上一层"
+		back.desc = "返回上一层"
 	}
-	help := "↑↓/PgUp/PgDn · enter/双击打开文件夹 · " + back + " · 右键/m菜单 · p暂停 · r恢复 · x取消 · c清除已完成 · u检查更新"
-	b.WriteString(helpStyle.Render(truncate(help, max(20, m.width))))
+	hints := append([]keyHint{downloadHints[0], back}, downloadHints[1:]...)
+	b.WriteString(helpStyle.Render(hintLine(hints, max(20, m.width))))
 	return b.String()
 }
 
@@ -2742,6 +2898,15 @@ func (m model) viewLogin() string {
 	var b strings.Builder
 	b.WriteString(titleStyle.Render("GoQuark 登录"))
 	b.WriteString("\n")
+	var tabs []string
+	for _, meth := range []auth.Method{auth.MethodQuark, auth.MethodWeChat} {
+		if meth == m.loginMethod {
+			tabs = append(tabs, menuSelSt.Render(" "+meth.Label()+" "))
+		} else {
+			tabs = append(tabs, helpStyle.Render(" "+meth.Label()+" "))
+		}
+	}
+	b.WriteString(strings.Join(tabs, " ") + "\n")
 
 	// status line
 	status := m.loginStatus
@@ -2761,7 +2926,7 @@ func (m model) viewLogin() string {
 		art := strings.TrimRight(m.loginQRArt, "\n")
 		b.WriteString(art)
 		b.WriteString("\n\n")
-		b.WriteString(helpStyle.Render("夸克 APP → 搜索框相机 → 扫码"))
+		b.WriteString(helpStyle.Render(m.loginMethod.ScanHint()))
 		b.WriteString("\n")
 	} else if m.loginBusy {
 		b.WriteString(helpStyle.Render("正在生成二维码…"))
@@ -2772,7 +2937,7 @@ func (m model) viewLogin() string {
 	}
 
 	b.WriteString("\n")
-	b.WriteString(helpStyle.Render("l 刷新二维码 · q 退出"))
+	b.WriteString(helpStyle.Render("l 刷新二维码 · Tab 切换夸克/微信 · q 退出"))
 	return b.String()
 }
 
@@ -2984,6 +3149,9 @@ func (m model) renderModal() string {
 		if m.confirmAction == "conflict_replace" {
 			hint = "←/→ 切换 · Enter 当前高亮 · Esc 替换 · 可点击"
 		}
+		if m.confirmAction == "quit_choice" {
+			hint = "←/→ 切换 · Enter 确认 · 空格 勾选 · Esc 取消 · 可点击"
+		}
 		if m.confirmAction == "update_available" && m.updateRes != nil &&
 			len(updateNotesLines(m.updateRes.Notes)) > updateNotesCollapsed {
 			hint = "←/→ 切换 · d 展开/收起说明 · Enter 确认 · 可点击"
@@ -3025,6 +3193,11 @@ func (m model) renderModal() string {
 		content := title + "\n\n" + m.modalBody + "\n\n" + btnLine + "\n\n" +
 			footerDim.Render("Esc 或点击上方按钮中止 · 其他操作不影响下载")
 		return confirmBox.Copy().UnsetForeground().UnsetBold().Render(content)
+	case "help":
+		footerDim := lipgloss.NewStyle().Foreground(lipgloss.Color("241")).Background(lipgloss.Color("235"))
+		title := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("45")).Render(m.modalTitle)
+		body := title + "\n\n" + m.modalBody + "\n\n" + footerDim.Render("按快捷键直接执行 · ? / Esc / Enter 关闭")
+		return okBox.Copy().UnsetForeground().Render(body)
 	case "error":
 		footerDim := lipgloss.NewStyle().Foreground(lipgloss.Color("241")).Background(lipgloss.Color("235"))
 		body := modalTitle.Render(m.modalTitle) + "\n\n" + m.modalBody + "\n\n" + footerDim.Render("Enter / Esc 关闭 · 可点击")

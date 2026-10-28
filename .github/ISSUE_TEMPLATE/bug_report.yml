@@ -1,0 +1,93 @@
+name: Bug 反馈 / Bug report
+description: 功能不正常、报错或界面显示有问题 / Something does not work as expected
+title: "[Bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        提交前请先更新到最新版：在 TUI 里按 `u`，或运行 `goquark update`。
+        **请不要贴出 `config.json`、Cookie 或登录二维码**，它们能直接登录你的网盘。
+
+        Please update first (`u` in the TUI, or `goquark update`). Never paste `config.json`, cookies or the login QR code.
+
+  - type: input
+    id: version
+    attributes:
+      label: 版本 / Version
+      description: 运行 `goquark version`，贴出第一行 / First line of `goquark version`
+      placeholder: "version: 1.1.0 (commit 0e590af, built 2026-10-25T11:31:00Z)"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: os
+    attributes:
+      label: 系统 / OS
+      options:
+        - macOS
+        - Linux
+        - Windows
+        - 其他 / Other
+    validations:
+      required: true
+
+  - type: input
+    id: terminal
+    attributes:
+      label: 终端 / Terminal
+      description: TUI 的问题请填写 / For TUI issues
+      placeholder: 例如 kitty、iTerm2、Windows Terminal、GNOME Terminal
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: 出现在哪里 / Where
+      options:
+        - TUI 界面
+        - 命令行 / CLI
+        - MCP
+        - 安装或更新 / Install or update
+        - 其他 / Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: what
+    attributes:
+      label: 问题现象 / What happened
+      placeholder: 例如：下载中心任务超过一屏时，按 ↑↓ 视图不跟着滚动，高亮行跑到屏幕外面
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: 复现步骤 / Steps to reproduce
+      placeholder: |
+        1. 在网盘里选中一个有 50 个文件的文件夹，按 d
+        2. 按 t 打开下载中心
+        3. 一直按 ↓
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: 期望结果 / Expected
+      placeholder: 例如：光标移出屏幕时，视图跟着滚动
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: 报错信息 / Error output
+      description: 终端里的报错原文，会按代码格式显示 / Pasted as code
+      render: text
+
+  - type: textarea
+    id: media
+    attributes:
+      label: 截图或录屏 / Screenshots or recording
+      description: 可直接把图片或视频拖进来 / Drag files in here

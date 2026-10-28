@@ -29,7 +29,7 @@ GoQuark is a **Go** client for Quark cloud drive, aimed at terminals and automat
 
 | Area | Capability |
 |------|------------|
-| Login | **QR code** via the Quark app, or WeChat (`--wechat`) |
+| Login | **QR code** via the Quark app or WeChat |
 | Download | Speed **close to the real client**; queue, pause/resume, progress & ETA |
 | Browse | Terminal **TUI**: select, multi-select, context menu, download center |
 | Scripts | CLI + pipe / `--json` output |
@@ -42,7 +42,7 @@ GoQuark is a **Go** client for Quark cloud drive, aimed at terminals and automat
 
 ## Features
 
-- QR login; local device profile with customizable name  
+- QR login with the Quark app or WeChat; local device profile with customizable name  
 - Multi-file and recursive folder downloads, download center, history  
 - Pause / resume / cancel; safe shutdown on quit  
 - Browse & account info (`ls` / `whoami`)  
@@ -144,7 +144,8 @@ First launch walks you through QR login. For most day-to-day use, stay in the TU
 
 ```bash
 goquark login          # QR login (terminal + qrcode.png)
-goquark login --wechat # scan with WeChat instead of the Quark app
+goquark login --wechat # scan with WeChat instead
+goquark logout         # log out (the device profile is kept)
 goquark device
 goquark whoami
 goquark ls /
@@ -178,9 +179,16 @@ Session cookies stay **local only**. Never commit or share a config that contain
 | Right-click / `m` | Menu |
 | `p` / `r` / `x` / `c` | Pause / resume / cancel / clear finished (in center) |
 | `q` | Quit (confirms; safely pauses active jobs) |
+| `Tab` | Login screen: switch between Quark-app and WeChat scan (Quark by default) |
+| `o` | Log out (after confirming; pauses downloads, ends the session on the server and locally) |
+| `?` | List every shortcut of the current view |
 
 Files and folders can be picked together. The selected folder's own name, every subdirectory and the empty ones are kept, so picking `docs` saves to `<download dir>/docs/sub/file`.
 In the download center a downloaded folder takes one row with the progress of the whole folder; Enter or a double-click opens it level by level. Every level lists folders above files, each ordered downloading → failed → queued → paused → finished; a row whose status changes shows it in place and moves about 4 seconds later, and a paused row stays put. Folders downloaded with 1.0.6 that are still in the history are grouped too after the update. How many files download at once is `max_downloads` above; per-file chunk concurrency (`concurrency`) is a separate setting. The CLI and MCP download entry points take files only.
+
+Downloads are run by a background download service: the TUI, MCP and `goquark download` share one queue and one history, so running them at once no longer makes them overwrite each other. The service starts with the first download and exits when nothing is downloading and no GoQuark process is connected. After an update, running downloads carry on and the service switches to the new version once they finish. It logs to `download-service.log` in the config directory; `GOQUARK_DOWNLOAD_SERVICE=off` makes each process download on its own.
+
+The first time you quit the TUI with downloads running, it asks whether to pause them or let them finish in the background, with “don't ask again” ticked by default. The choice is kept as `tui_quit_downloads` (`pause` / `background`) in `config.json`; remove it, or set `tui_quit: "ask"` with the MCP tool `goquark_download_settings`, to be asked again.
 
 ---
 
@@ -227,8 +235,9 @@ stdio server: host runs `goquark mcp` (**absolute path** required).
 | Tool | Description |
 |------|-------------|
 | `goquark_status` | Login/config/version |
-| `goquark_login` | Start QR login; returns **labeled** `qr_url` / `qr_content` / `qr_ascii` |
+| `goquark_login` | Start QR login (`method`: `quark` app, default, or `wechat`); returns **labeled** `qr_url` / `qr_content` / `qr_ascii` |
 | `goquark_login_poll` | Poll until `logged_in` |
+| `goquark_logout` | Log out: pauses downloads, ends the session on the server, then clears it locally; the device is kept |
 | `goquark_device` | Local device profile |
 | `goquark_whoami` | Account info |
 | `goquark_ls` | List directory |

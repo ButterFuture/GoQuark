@@ -180,6 +180,11 @@ func (c *Client) setCommon(req *http.Request) {
 //   - merges Set-Cookie into config session (official Electron does this automatically)
 //   - returns *AuthError on 31001/31004/NO_AUTH/AUTH_ERROR/HTTP 401/403
 func (c *Client) DoJSON(method, rawURL string, query url.Values, body any) (map[string]any, error) {
+	return c.DoJSONCtx(context.Background(), method, rawURL, query, body)
+}
+
+// DoJSONCtx is DoJSON bounded by ctx.
+func (c *Client) DoJSONCtx(ctx context.Context, method, rawURL string, query url.Values, body any) (map[string]any, error) {
 	u, err := url.Parse(rawURL)
 	if err != nil {
 		return nil, err
@@ -220,7 +225,7 @@ func (c *Client) DoJSON(method, rawURL string, query url.Values, body any) (map[
 		}
 		rdr = strings.NewReader(string(b))
 	}
-	req, err := http.NewRequest(method, u.String(), rdr)
+	req, err := http.NewRequestWithContext(ctx, method, u.String(), rdr)
 	if err != nil {
 		return nil, err
 	}

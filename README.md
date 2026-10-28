@@ -29,7 +29,7 @@ GoQuark 是用 **Go** 写的夸克网盘客户端，面向命令行与自动化�
 
 | 场景 | 能力 |
 |------|------|
-| 登录 | 夸克 APP **扫码登录**，或微信扫码（`--wechat`） |
+| 登录 | 夸克 APP 或微信 **扫码登录** |
 | 下载 | **贴近真实客户端** 的下载速度；队列、暂停/继续、进度与 ETA |
 | 浏览 | 终端 **TUI**：点选、多选、右键菜单、下载中心 |
 | 脚本 | CLI + 管道 / `--json` 输出 |
@@ -42,7 +42,7 @@ GoQuark 是用 **Go** 写的夸克网盘客户端，面向命令行与自动化�
 
 ## 功能一览
 
-- 扫码登录，设备信息本地固定、可自定义名称  
+- 夸克 APP 或微信扫码登录，设备信息本地固定、可自定义名称  
 - 多文件与文件夹递归下载、下载中心、历史记录  
 - 暂停 / 继续 / 取消；退出时安全收尾  
 - 目录浏览、用户信息（`ls` / `whoami`）  
@@ -149,7 +149,8 @@ goquark tui
 
 ```bash
 goquark login          # 扫码登录（终端出码 + qrcode.png）
-goquark login --wechat # 改用微信扫码登录
+goquark login --wechat # 改用微信扫码
+goquark logout         # 退出登录（设备信息保留）
 goquark device         # 设备信息
 goquark whoami         # 当前用户
 goquark ls /           # 列目录
@@ -183,9 +184,16 @@ goquark version
 | 右键 / `m` | 菜单 |
 | `p` / `r` / `x` / `c` | 暂停 / 恢复 / 取消 / 清除已完成（中心内） |
 | `q` | 退出（确认后安全暂停进行中的任务） |
+| `Tab` | 登录页：在夸克扫码与微信扫码之间切换（默认夸克） |
+| `o` | 退出登录（确认后暂停下载，让服务端会话失效并清除本地会话） |
+| `?` | 列出当前页面的全部快捷键 |
 
 文件与文件夹可以混选。所选文件夹的名称、各级子目录和空文件夹都会保留，选中 `资料` 后保存为 `下载目录/资料/子目录/文件`。
 下载中心里，一次下载的文件夹只占一行，显示整个文件夹的进度，回车或双击可逐层展开。每一层都是文件夹在上、文件在下，各自按 下载中 → 失败 → 排队 → 已暂停 → 已完成 排列；状态变化后先原地显示，约 4 秒后再移到新位置，暂停的任务留在原处。1.0.6 下载、仍在历史记录里的文件夹，升级后同样按文件夹显示。同时下载的文件数见上表的 `max_downloads`，单个文件的分块并发（`concurrency`）是另一项设置。CLI 与 MCP 的下载入口目前只接受文件。
+
+下载统一由后台的下载服务管理：TUI、MCP 与 `goquark download` 共用同一个下载队列和下载记录，同时开着也不会互相覆盖。服务在第一次下载时自动启动，没有下载、也没有 GoQuark 连着时自行退出。更新 GoQuark 后，正在进行的下载不会中断，服务等它们结束再换成新版本。日志在配置目录的 `download-service.log`；设置 `GOQUARK_DOWNLOAD_SERVICE=off` 可让每个进程各自下载。
+
+有下载在进行时第一次退出 TUI，会问你要暂停这些下载，还是让它们在后台继续下完；「下次不再询问」默认勾选。记住的选择存在 `config.json` 的 `tui_quit_downloads`（`pause` / `background`），删掉这一项或通过 MCP 工具 `goquark_download_settings` 设 `tui_quit: "ask"`，就会重新询问。
 
 ---
 
@@ -232,8 +240,9 @@ goquark version
 | Tool | 说明 |
 |------|------|
 | `goquark_status` | 登录态 / 配置 / 版本 |
-| `goquark_login` | 发起扫码登录，返回 **明确标注** 的 `qr_url` / `qr_content` / `qr_ascii` |
+| `goquark_login` | 发起扫码登录（`method`：`quark` 夸克 APP，默认 / `wechat` 微信），返回 **明确标注** 的 `qr_url` / `qr_content` / `qr_ascii` |
 | `goquark_login_poll` | 轮询扫码结果至 `logged_in` |
+| `goquark_logout` | 退出登录：暂停下载，让服务端会话失效，再清本地会话，设备信息保留 |
 | `goquark_device` | 本地设备信息 |
 | `goquark_whoami` | 当前用户 |
 | `goquark_ls` | 列目录 |

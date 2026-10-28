@@ -1,0 +1,40 @@
+name: 功能建议 / Feature request
+description: 想要新功能，或希望改进现有功能 / Suggest something new or better
+title: "[建议] "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: 想解决什么问题 / The problem
+      description: 说说你在做什么、哪里不方便 / What you are trying to do and what gets in the way
+      placeholder: 例如：下载整张专辑时，下载中心一下子多出几百行，找不到别的任务
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: 希望怎么做 / What you would like
+      placeholder: 例如：一个文件夹在下载中心里只显示一行，点进去再看里面的文件
+    validations:
+      required: true
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: 涉及哪里 / Where
+      options:
+        - TUI 界面
+        - 命令行 / CLI
+        - MCP
+        - 配置文件 / config.json
+        - 其他 / Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: workaround
+    attributes:
+      label: 目前怎么凑合 / Current workaround
+      placeholder: 没有的话可以不填 / Leave empty if none

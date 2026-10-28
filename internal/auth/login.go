@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -49,6 +50,8 @@ type Options struct {
 	OnStatus   func(msg string)
 	// OnQR is called once QR content is ready (url + terminal ASCII art).
 	OnQR func(qrURL, ascii string)
+	// Ctx cancels a login in progress (nil = never).
+	Ctx context.Context
 }
 
 func defaultOpts(o *Options, cfg *config.Config) {
@@ -67,6 +70,21 @@ func defaultOpts(o *Options, cfg *config.Config) {
 	}
 	if o.OnStatus == nil {
 		o.OnStatus = func(string) {}
+	}
+	if o.Ctx == nil {
+		o.Ctx = context.Background()
+	}
+}
+
+// sleepCtx waits d, returning early with the context's error on cancel.
+func sleepCtx(ctx context.Context, d time.Duration) error {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-t.C:
+		return nil
 	}
 }
 
@@ -99,6 +117,31 @@ func writeQRFiles(qrURL, pngPath, urlPath string) error {
 	return os.WriteFile(pngPath, png, 0o600)
 }
 
+// presentQR writes the QR files, renders the terminal art and hands both to
+// the caller; hint is the scan instruction printed unless opt.Quiet.
+func presentQR(qrURL, hint string, opt Options) (string, error) {
+	if err := writeQRFiles(qrURL, opt.QRPngPath, opt.QRURLPath); err != nil {
+		return "", err
+	}
+	ascii := ""
+	if art, err := qrcode.New(qrURL, qrcode.Medium); err == nil {
+		// ToSmallString is compact half-block QR suitable for terminals.
+		ascii = art.ToSmallString(false)
+	}
+	if opt.OnQR != nil {
+		opt.OnQR(qrURL, ascii)
+	}
+	if opt.PrintASCII && ascii != "" {
+		fmt.Println(ascii)
+	}
+	opt.OnStatus("qr ready: " + opt.QRPngPath)
+	if !opt.Quiet {
+		fmt.Println(hint)
+		fmt.Println(qrURL)
+	}
+	return ascii, nil
+}
+
 // LoginQR runs official PC QR login flow and persists session into cfg.
 // Demo builds (-tags demo / goquarkdemo) use a full mock path (fake QR, auto success).
 func LoginQR(cfg *config.Config, opt Options) (*LoginResult, error) {
@@ -119,24 +162,8 @@ func LoginQR(cfg *config.Config, opt Options) (*LoginResult, error) {
 		return nil, err
 	}
 	qrURL := buildScanURL(token)
-	if err := writeQRFiles(qrURL, opt.QRPngPath, opt.QRURLPath); err != nil {
+	if _, err := presentQR(qrURL, "扫码: 夸克APP → 搜索框相机 → 扫码", opt); err != nil {
 		return nil, err
-	}
-	ascii := ""
-	if art, err := qrcode.New(qrURL, qrcode.Medium); err == nil {
-		// ToSmallString is compact half-block QR suitable for terminals.
-		ascii = art.ToSmallString(false)
-	}
-	if opt.OnQR != nil {
-		opt.OnQR(qrURL, ascii)
-	}
-	if opt.PrintASCII && ascii != "" {
-		fmt.Println(ascii)
-	}
-	opt.OnStatus("qr ready: " + opt.QRPngPath)
-	if !opt.Quiet {
-		fmt.Println("扫码: 夸克APP → 搜索框相机 → 扫码")
-		fmt.Println(qrURL)
 	}
 
 	if opt.TokenOnly {
@@ -146,10 +173,15 @@ func LoginQR(cfg *config.Config, opt Options) (*LoginResult, error) {
 	deadline := time.Now().Add(opt.Timeout)
 	var st string
 	for time.Now().Before(deadline) {
+		if err := opt.Ctx.Err(); err != nil {
+			return nil, err
+		}
 		ticket, status, msg, err := pollTicket(hc, cfg, token)
 		if err != nil {
 			opt.OnStatus("poll err: " + err.Error())
-			time.Sleep(opt.Interval)
+			if err := sleepCtx(opt.Ctx, opt.Interval); err != nil {
+				return nil, err
+			}
 			continue
 		}
 		switch status {
@@ -166,7 +198,9 @@ func LoginQR(cfg *config.Config, opt Options) (*LoginResult, error) {
 		default:
 			opt.OnStatus(fmt.Sprintf("status=%d %s", status, msg))
 		}
-		time.Sleep(opt.Interval)
+		if err := sleepCtx(opt.Ctx, opt.Interval); err != nil {
+			return nil, err
+		}
 	}
 	return nil, fmt.Errorf("login timeout")
 

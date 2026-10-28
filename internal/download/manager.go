@@ -126,6 +126,13 @@ type Manager struct {
 	saves sync.WaitGroup
 	// optional: re-resolve URL from fid on resume
 	ResolveURL func(fid string) (url string, total int64, err error)
+	// OnReloadSession, if set, rebinds the client from the saved login.
+	OnReloadSession func()
+
+	readOnly bool          // never write the state file (a viewer of it)
+	stateSeq atomic.Uint64 // order of state snapshots
+	saveMu   sync.Mutex    // serializes state writes
+	savedSeq uint64        // newest snapshot on disk, under saveMu
 	// fetch fetches one file; nil means File. Tests swap in a stand-in so the
 	// queue, pause and resume logic runs without the network.
 	fetch func(ctx context.Context, c *client.Client, dlURL, dest string, opt Options) error
@@ -209,6 +216,14 @@ func (m *Manager) SetMaxLive(n int) int {
 	}
 	m.live.setLimit(n)
 	return n
+}
+
+// SetReadOnly makes the manager a viewer of its state file: it loads it but
+// never writes it, for a process that only shows the downloads.
+func (m *Manager) SetReadOnly() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.readOnly = true
 }
 
 func (m *Manager) SetStatePath(p string) {
@@ -1239,20 +1254,20 @@ func HasPersistedIncomplete() (int, error) {
 
 func (m *Manager) saveLocked() error {
 	path := m.statePath
-	if path == "" {
+	if path == "" || m.readOnly {
 		return nil
 	}
 	b, err := m.marshalStateLocked()
 	if err != nil {
 		return err
 	}
+	seq := m.stateSeq.Add(1)
 	// CRITICAL: never block UI/list under this lock with disk I/O.
 	// Callers hold m.mu; write async.
 	m.saves.Add(1)
 	go func(p string, data []byte) {
 		defer m.saves.Done()
-		_ = os.MkdirAll(filepath.Dir(p), 0o755)
-		_ = os.WriteFile(p, data, 0o600)
+		m.writeState(p, seq, data)
 	}(path, b)
 	return nil
 }
@@ -1261,17 +1276,58 @@ func (m *Manager) saveLocked() error {
 func (m *Manager) saveAsync() {
 	m.mu.RLock()
 	path := m.statePath
-	if path == "" {
+	if path == "" || m.readOnly {
 		m.mu.RUnlock()
 		return
 	}
 	b, err := m.marshalStateLocked()
+	seq := m.stateSeq.Add(1)
 	m.mu.RUnlock()
 	if err != nil {
 		return
 	}
-	_ = os.MkdirAll(filepath.Dir(path), 0o755)
-	_ = os.WriteFile(path, b, 0o600)
+	m.writeState(path, seq, b)
+}
+
+// writeState puts snapshot seq on disk unless a newer one already is, and
+// replaces the file in one rename, so a reader never sees half of it and a
+// slow older save cannot overwrite a newer one.
+func (m *Manager) writeState(path string, seq uint64, data []byte) {
+	m.saveMu.Lock()
+	defer m.saveMu.Unlock()
+	if seq <= m.savedSeq {
+		return
+	}
+	if err := writeFileAtomic(path, data); err == nil {
+		m.savedSeq = seq
+	}
+}
+
+func writeFileAtomic(path string, data []byte) error {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
+	}
+	f, err := os.CreateTemp(dir, filepath.Base(path)+".tmp*")
+	if err != nil {
+		return err
+	}
+	tmp := f.Name()
+	_, werr := f.Write(data)
+	cerr := f.Close()
+	if werr == nil {
+		werr = cerr
+	}
+	if werr == nil {
+		werr = os.Chmod(tmp, 0o600)
+	}
+	if werr == nil {
+		werr = os.Rename(tmp, path)
+	}
+	if werr != nil {
+		_ = os.Remove(tmp)
+	}
+	return werr
 }
 
 func (m *Manager) marshalStateLocked() ([]byte, error) {

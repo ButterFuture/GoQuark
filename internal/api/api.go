@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/ButterFuture/GoQuark/internal/client"
+	"github.com/ButterFuture/GoQuark/internal/output"
 )
 
 // FileEntry is a simplified drive file row.
@@ -63,7 +64,8 @@ func UserInfo(c *client.Client) (map[string]any, error) {
 	} else if client.IsAuthError(err) {
 		return nil, err
 	}
-	return data, nil
+	// userinfo also carries the session's credentials; never pass them on.
+	return output.PublicUser(data), nil
 }
 
 // ListDir lists a directory. pdirFID empty/"0" means root.

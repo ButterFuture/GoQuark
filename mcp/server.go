@@ -14,6 +14,7 @@ import (
 	"github.com/ButterFuture/GoQuark/internal/client"
 	"github.com/ButterFuture/GoQuark/internal/config"
 	"github.com/ButterFuture/GoQuark/internal/device"
+	"github.com/ButterFuture/GoQuark/internal/dlsvc"
 	"github.com/ButterFuture/GoQuark/internal/download"
 	"github.com/ButterFuture/GoQuark/internal/update"
 	"github.com/mark3labs/mcp-go/mcp"
@@ -34,11 +35,10 @@ func Run(version string) error {
 		return err
 	}
 	c := client.New(cfg)
-	mgr := download.Global()
-	mgr.BindClient(c)
+	// Downloads go to the download service shared with the TUI and CLI.
+	mgr := dlsvc.Open(cfg.Path())
 	mgr.SetMaxLive(cfg.MaxDownloads)
 	mgr.SetDestDir(cfg.EffectiveDownloadDir())
-	_, _ = mgr.LoadPersisted()
 
 	// MCP login session (in-process; one active QR at a time)
 	var loginSess *auth.QRSession
@@ -76,11 +76,16 @@ func Run(version string) error {
 
 	s.AddTool(mcp.NewTool("goquark_login",
 		mcp.WithDescription("Start Quark QR login for agents. Returns CLEARLY LABELED qr_url (open/scan link) and qr_ascii (terminal QR art). Does NOT wait for scan — call goquark_login_poll after showing QR to the user. If already logged in and force=false, returns logged_in without new QR."),
+		mcp.WithString("method", mcp.Description("What the user scans with: quark (Quark app, default) or wechat (WeChat)."), mcp.DefaultString("quark")),
 		mcp.WithBoolean("force", mcp.Description("If true, start a new QR even when already logged in. Default false."), mcp.DefaultBool(false)),
 		mcp.WithBoolean("include_ascii", mcp.Description("Include qr_ascii terminal art (default true). Set false if only the link is needed."), mcp.DefaultBool(true)),
 	), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		force := argBool(req, "force", false)
 		includeASCII := argBool(req, "include_ascii", true)
+		method, err := auth.ParseMethod(argString(req, "method", "quark"))
+		if err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
 
 		if cfg.HasSessionCookie() && !force {
 			return textJSON(map[string]any{
@@ -97,7 +102,7 @@ func Run(version string) error {
 			cfg = reloaded
 			_ = device.EnsureDevice(cfg, "")
 			c = client.New(cfg)
-			mgr.BindClient(c)
+			mgr.ReloadSession()
 		}
 
 		dir := filepath.Dir(cfg.Path())
@@ -105,10 +110,16 @@ func Run(version string) error {
 		pngPath := filepath.Join(dir, "mcp-qrcode.png")
 		urlPath := filepath.Join(dir, "mcp-qrcode.url.txt")
 
-		sess, err := auth.StartQRLogin(cfg, auth.Options{
+		loginSess.Close()
+		loginSess = nil
+		timeout := 3 * time.Minute
+		if method == auth.MethodWeChat {
+			timeout = auth.WeChatQRLifetime
+		}
+		sess, err := auth.StartLogin(cfg, method, auth.Options{
 			QRPngPath:  pngPath,
 			QRURLPath:  urlPath,
-			Timeout:    3 * time.Minute,
+			Timeout:    timeout,
 			PrintASCII: false,
 			Quiet:      true,
 		})
@@ -117,17 +128,24 @@ func Run(version string) error {
 		}
 		loginSess = sess
 
+		qrDesc := "Quark scan-login URL. User opens Quark APP → search-box camera → scan this link/QR."
+		howTo := "夸克 APP → 顶部搜索框旁相机 → 扫码。扫描对象是 qr_url / qr_content，不是普通网页链接。"
+		if method == auth.MethodWeChat {
+			qrDesc = "WeChat login URL. User opens WeChat → Scan (扫一扫) → scans this QR, then confirms in WeChat."
+			howTo = "微信 → 扫一扫 → 扫码后在微信里点确认。扫描对象是 qr_url / qr_content 生成的二维码。"
+		}
 		out := map[string]any{
 			// Explicit labels for agents — do not confuse these fields
-			"ok":    true,
-			"phase": "qr_ready",
+			"ok":        true,
+			"phase":     "qr_ready",
+			"method":    string(method),
 			"logged_in": false,
-			"message": "Show qr_url and/or qr_ascii to the user; then poll with goquark_login_poll until phase=logged_in",
+			"message":   "Show qr_url and/or qr_ascii to the user; then poll with goquark_login_poll until phase=logged_in",
 
 			// --- QR payload (explicit names) ---
 			"qr_url": map[string]any{
 				"type":        "login_qr_link",
-				"description": "Quark scan-login URL. User opens Quark APP → search-box camera → scan this link/QR.",
+				"description": qrDesc,
 				"value":       sess.QRURL,
 			},
 			"qr_content": map[string]any{
@@ -140,7 +158,7 @@ func Run(version string) error {
 				"description": "Local PNG of the QR (host filesystem; agent may open if same machine).",
 				"value":       sess.QRPngPath,
 			},
-			"how_to_scan": "夸克 APP → 顶部搜索框旁相机 → 扫码。扫描对象是 qr_url / qr_content，不是普通网页链接。",
+			"how_to_scan": howTo,
 			"next_step":  "Call goquark_login_poll every few seconds until phase is logged_in, expired, or timeout.",
 		}
 		if includeASCII && sess.QRASCII != "" {
@@ -177,7 +195,7 @@ func Run(version string) error {
 				cfg = reloaded
 			}
 			c = client.New(cfg)
-			mgr.BindClient(c)
+			mgr.ReloadSession()
 		}
 		out := map[string]any{
 			"phase":     res.Phase,
@@ -207,6 +225,37 @@ func Run(version string) error {
 		if res.LoggedIn {
 			out["user"] = auth.UserInfoFromSession(cfg)
 			out["next_step"] = "Login complete. Use goquark_ls / goquark_download / goquark_whoami."
+		}
+		return textJSON(out)
+	})
+
+	s.AddTool(mcp.NewTool("goquark_logout",
+		mcp.WithDescription("Log out: pauses all downloads, ends the session on Quark's server (like the PC client's 退出登录), then clears the saved session locally even if the server call fails. The device profile is kept, so the next login is the same device; paused downloads can be resumed after logging in again."),
+	), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		loginSess.Close()
+		loginSess = nil
+		paused := mgr.PauseAll()
+		was := cfg.HasSessionCookie()
+		var serverErr error
+		if was {
+			serverErr = api.Logout(c)
+		}
+		cfg.ClearSession()
+		if err := cfg.Save(); err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
+		c = client.New(cfg)
+		mgr.ReloadSession()
+		out := map[string]any{
+			"ok":               true,
+			"logged_in":        false,
+			"was_logged_in":    was,
+			"server_logout":    was && serverErr == nil,
+			"paused_downloads": paused,
+		}
+		if serverErr != nil {
+			out["server_error"] = serverErr.Error()
+			out["message"] = "logged out locally; the server did not confirm, so the old session may still be valid"
 		}
 		return textJSON(out)
 	})
@@ -384,9 +433,8 @@ func Run(version string) error {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
 
-		mgr.BindClient(c)
 		mgr.SetDestDir(cfg.EffectiveDownloadDir())
-		task, err := mgr.EnqueueEx(download.EnqueueOpts{
+		taskID, err := mgr.Add(download.EnqueueOpts{
 			Name: filepath.Base(local),
 			URL:  urlStr,
 			Dest: local,
@@ -395,16 +443,20 @@ func Run(version string) error {
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
+		taskStatus := download.StatusQueued
+		if s := findTask(mgr, taskID); s != nil {
+			taskStatus = s.Status
+		}
 
 		out := map[string]any{
-			"task_id":    task.ID,
+			"task_id":    taskID,
 			"fid":        fid,
 			"name":       name,
 			"local":      local,
 			"size_api":   size,
 			"enqueued":   true,
 			"wait":       wait,
-			"status":     string(task.Status),
+			"status":     string(taskStatus),
 		}
 		if !wait {
 			return textJSON(out)
@@ -419,7 +471,7 @@ func Run(version string) error {
 			if time.Now().After(deadline) {
 				return mcp.NewToolResultError("download wait timeout"), nil
 			}
-			snap := findTask(mgr, task.ID)
+			snap := findTask(mgr, taskID)
 			if snap == nil {
 				time.Sleep(300 * time.Millisecond)
 				continue
@@ -488,8 +540,9 @@ func Run(version string) error {
 	})
 
 	s.AddTool(mcp.NewTool("goquark_download_settings",
-		mcp.WithDescription("Read or change how many files download at once (max_downloads; the rest queue). Without arguments, reports the current limit and how many files are downloading and queued. With max_downloads (1-10, 0 = default 3), applies it at once to the running queue and, unless persist=false, saves it to config.json so the TUI and CLI use it too."),
+		mcp.WithDescription("Read or change download settings. max_downloads: how many files download at once (the rest queue); with a value (1-10, 0 = default 3) it applies at once to the running queue and, unless persist=false, is saved to config.json so the TUI and CLI use it too. tui_quit: what quitting the TUI does to running downloads — ask (the default: the TUI asks, offering to remember), pause, or background (the download service finishes them); always saved to config.json. Without arguments, reports both and how many files are downloading and queued."),
 		mcp.WithNumber("max_downloads", mcp.Description("Files to download at once, 1-10; 0 restores the default (3). Omit to only read the settings.")),
+		mcp.WithString("tui_quit", mcp.Description("ask | pause | background: what quitting the TUI does to running downloads. Omit to only read it.")),
 		mcp.WithBoolean("persist", mcp.Description("Save to config.json (default true). false changes this MCP session only."), mcp.DefaultBool(true)),
 	), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		const unset = -1
@@ -518,6 +571,29 @@ func Run(version string) error {
 				out["persisted"] = true
 			}
 		}
+		if want := strings.TrimSpace(argString(req, "tui_quit", "")); want != "" {
+			stored := want
+			switch want {
+			case "ask":
+				stored = ""
+			case "pause", "background":
+			default:
+				return mcp.NewToolResultError("tui_quit must be ask, pause or background"), nil
+			}
+			fresh, err := config.Load(cfg.Path())
+			if err != nil {
+				return mcp.NewToolResultError(fmt.Sprintf("could not read config: %v", err)), nil
+			}
+			fresh.TUIQuitDownloads = stored
+			if err := fresh.Save(); err != nil {
+				return mcp.NewToolResultError(fmt.Sprintf("could not save config: %v", err)), nil
+			}
+		}
+		tuiQuit := "ask"
+		if fresh, err := config.Load(cfg.Path()); err == nil && fresh.TUIQuitDownloads != "" {
+			tuiQuit = fresh.TUIQuitDownloads
+		}
+		out["tui_quit"] = tuiQuit
 		live, queued, limit := mgr.LiveCount()
 		out["max_downloads"] = limit
 		out["downloading"] = live
@@ -711,7 +787,7 @@ func shortID(s string) string {
 	return s
 }
 
-func findTask(mgr *download.Manager, id string) *download.Snapshot {
+func findTask(mgr download.Controller, id string) *download.Snapshot {
 	for _, t := range mgr.List() {
 		if t.ID == id {
 			tt := t

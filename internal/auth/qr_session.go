@@ -1,21 +1,25 @@
 package auth
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/cookiejar"
+	"sync"
 	"time"
 
 	"github.com/ButterFuture/GoQuark/internal/config"
 	"github.com/ButterFuture/GoQuark/internal/demobuild"
 	"github.com/ButterFuture/GoQuark/internal/device"
-	"github.com/skip2/go-qrcode"
+	"github.com/ButterFuture/GoQuark/internal/output"
 )
 
 // QRSession is a multi-step login session for agents (MCP).
-// Create with StartQRLogin → show QRURL / QRASCII to user → PollQRLogin until done.
+// Create with StartLogin → show QRURL / QRASCII to user → PollQRLogin until done.
 type QRSession struct {
+	Method    Method
 	Token     string
 	QRURL     string
 	QRASCII   string
@@ -23,9 +27,103 @@ type QRSession struct {
 	QRURLPath string
 	StartedAt time.Time
 	Timeout   time.Duration
+	// WeChat only: the long poll runs in the background and Poll reads its state.
+	wx *wxProgress
 	// demo-only fields (ignored when demobuild.Enabled is false)
 	demoDeadline time.Time
 	demoDone     bool
+}
+
+// Close stops a WeChat session's background poll; safe on any session.
+func (s *QRSession) Close() {
+	if s != nil && s.wx != nil {
+		s.wx.cancel()
+	}
+}
+
+type wxProgress struct {
+	cancel context.CancelFunc
+	mu     sync.Mutex
+	res    PollResult
+}
+
+func (p *wxProgress) set(phase, msg string) {
+	p.mu.Lock()
+	p.res.Phase, p.res.Message = phase, msg
+	p.res.LoggedIn = phase == "logged_in"
+	p.mu.Unlock()
+}
+
+// StartLogin is StartQRLogin for either method.
+func StartLogin(cfg *config.Config, m Method, opt Options) (*QRSession, error) {
+	if m != MethodWeChat || demobuild.Enabled {
+		return StartQRLogin(cfg, opt)
+	}
+	if opt.Timeout <= 0 {
+		opt.Timeout = WeChatQRLifetime
+	}
+	defaultOpts(&opt, cfg)
+	if err := device.EnsureDevice(cfg, ""); err != nil {
+		return nil, err
+	}
+	ctx, cancel := context.WithTimeout(opt.Ctx, opt.Timeout)
+	f := newWxFlow(cfg)
+	qrURL, err := f.start(ctx)
+	if err != nil {
+		cancel()
+		return nil, err
+	}
+	ascii, err := presentQR(qrURL, "扫码: "+MethodWeChat.ScanHint(), opt)
+	if err != nil {
+		cancel()
+		return nil, err
+	}
+	p := &wxProgress{cancel: cancel, res: PollResult{
+		Phase: "waiting_scan", Message: "waiting for WeChat scan", QRURL: qrURL, QRASCII: ascii,
+	}}
+	go func() {
+		defer cancel()
+		code, err := f.waitCode(ctx, time.Now().Add(opt.Timeout), func(s string) {
+			switch s {
+			case "scanned":
+				p.set("waiting_scan", "scanned; confirm in WeChat")
+			case "cancelled":
+				p.set("waiting_scan", "cancelled in WeChat; scan again")
+			case "scan confirmed":
+				p.set("scan_confirmed", "confirmed in WeChat, logging in")
+			}
+		})
+		var st string
+		if err == nil {
+			st, err = f.ticket(ctx, code)
+		}
+		if err == nil {
+			_, _, err = f.finish(st)
+		}
+		switch {
+		case err == nil:
+			p.set("logged_in", "login ok")
+		case errors.Is(err, errWxExpired):
+			p.set("expired", "qr expired; start a new login")
+		case errors.Is(err, errWxTimeout), errors.Is(err, context.DeadlineExceeded):
+			p.set("timeout", "login timeout")
+		case errors.Is(err, context.Canceled):
+			p.set("error", "login cancelled")
+		default:
+			p.set("error", err.Error())
+		}
+	}()
+	return &QRSession{
+		Method:    MethodWeChat,
+		Token:     f.uuid,
+		QRURL:     qrURL,
+		QRASCII:   ascii,
+		QRPngPath: opt.QRPngPath,
+		QRURLPath: opt.QRURLPath,
+		StartedAt: time.Now(),
+		Timeout:   opt.Timeout,
+		wx:        p,
+	}, nil
 }
 
 // StartQRLogin fetches a QR token and returns scan content without blocking.
@@ -47,17 +145,12 @@ func StartQRLogin(cfg *config.Config, opt Options) (*QRSession, error) {
 		return nil, err
 	}
 	qrURL := buildScanURL(token)
-	if err := writeQRFiles(qrURL, opt.QRPngPath, opt.QRURLPath); err != nil {
+	ascii, err := presentQR(qrURL, "扫码: "+MethodQuark.ScanHint(), opt)
+	if err != nil {
 		return nil, err
 	}
-	ascii := ""
-	if art, err := qrcode.New(qrURL, qrcode.Medium); err == nil {
-		ascii = art.ToSmallString(false)
-	}
-	if opt.OnQR != nil {
-		opt.OnQR(qrURL, ascii)
-	}
 	return &QRSession{
+		Method:    MethodQuark,
 		Token:     token,
 		QRURL:     qrURL,
 		QRASCII:   ascii,
@@ -88,6 +181,12 @@ func PollQRLogin(cfg *config.Config, sess *QRSession) (*PollResult, error) {
 	}
 	if demobuild.Enabled {
 		return pollQRLoginDemo(cfg, sess)
+	}
+	if sess.wx != nil {
+		sess.wx.mu.Lock()
+		res := sess.wx.res
+		sess.wx.mu.Unlock()
+		return &res, nil
 	}
 	if sess.Timeout > 0 && time.Since(sess.StartedAt) > sess.Timeout {
 		return &PollResult{
@@ -157,14 +256,19 @@ func PollQRLogin(cfg *config.Config, sess *QRSession) (*PollResult, error) {
 	}
 }
 
-// UserInfoFromSession returns a small JSON-friendly map from stored session user blob.
+// UserInfoFromSession returns the displayable account fields of the stored
+// login reply. That reply also holds the session credential (pus), so only
+// output.PublicUser fields come out, and an unparsable blob yields nothing.
 func UserInfoFromSession(cfg *config.Config) map[string]any {
 	if cfg == nil || len(cfg.Session.UserInfo) == 0 {
 		return nil
 	}
 	var m map[string]any
 	if json.Unmarshal(cfg.Session.UserInfo, &m) != nil {
-		return map[string]any{"raw": string(cfg.Session.UserInfo)}
+		return nil
 	}
-	return m
+	if d, ok := m["data"].(map[string]any); ok {
+		m = d
+	}
+	return output.PublicUser(m)
 }

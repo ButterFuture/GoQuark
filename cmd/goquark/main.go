@@ -7,8 +7,10 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/ButterFuture/GoQuark/internal/api"
@@ -16,6 +18,7 @@ import (
 	"github.com/ButterFuture/GoQuark/internal/client"
 	"github.com/ButterFuture/GoQuark/internal/config"
 	"github.com/ButterFuture/GoQuark/internal/device"
+	"github.com/ButterFuture/GoQuark/internal/dlsvc"
 	"github.com/ButterFuture/GoQuark/internal/download"
 	"github.com/ButterFuture/GoQuark/internal/output"
 	"github.com/ButterFuture/GoQuark/internal/tui"
@@ -55,6 +58,8 @@ func main() {
 		printVersion()
 	case "login":
 		cmdLogin(args)
+	case "logout":
+		cmdLogout(args)
 	case "device":
 		cmdDevice(args)
 	case "whoami":
@@ -67,6 +72,8 @@ func main() {
 		cmdDownloads(args)
 	case "tui":
 		cmdTUI(args)
+	case "download-service":
+		cmdDownloadService(args)
 	case "mcp":
 		if err := mcpserver.Run(Version); err != nil {
 			fatal(err)
@@ -117,6 +124,7 @@ func usage() {
 
 Usage:
   goquark login [--config PATH] [--nickname NAME] [--token-only] [--wechat]
+  goquark logout [--config PATH] [--json]   # ends the session; the device is kept
   goquark device [--config PATH] [--json]
   goquark whoami [--config PATH] [--json]
   goquark ls [PATH] [--config PATH] [--json]
@@ -188,8 +196,12 @@ func cmdLogin(args []string) {
 	cfgPath := fs.String("config", config.DefaultPath(), "config path")
 	nick := fs.String("nickname", "", "device display name override")
 	tokenOnly := fs.Bool("token-only", false, "only emit QR")
-	wechat := fs.Bool("wechat", false, "log in by scanning with WeChat instead of the Quark app")
+	wechat := fs.Bool("wechat", false, "scan with WeChat instead of the Quark app")
 	_ = fs.Parse(args)
+	method := auth.MethodQuark
+	if *wechat {
+		method = auth.MethodWeChat
+	}
 	cfg, err := config.Load(*cfgPath)
 	if err != nil {
 		fatal(err)
@@ -200,11 +212,7 @@ func cmdLogin(args []string) {
 	fmt.Printf("device: %s | %s | %s | id=%s\n",
 		cfg.Device.DeviceName, cfg.Device.Model, cfg.Device.Platform, cfg.Device.MachineID)
 
-	login := auth.LoginQR
-	if *wechat {
-		login = auth.LoginWeChat
-	}
-	res, err := login(cfg, auth.Options{
+	res, err := auth.Login(cfg, method, auth.Options{
 		TokenOnly:  *tokenOnly,
 		PrintASCII: true,
 		OnStatus: func(msg string) {
@@ -221,6 +229,56 @@ func cmdLogin(args []string) {
 	fmt.Println("LOGIN OK")
 	fmt.Printf("cookies: %d keys\n", len(res.Cookies))
 	fmt.Printf("config: %s\n", cfg.Path())
+}
+
+// cmdDownloadService runs the shared download service. GoQuark starts it on
+// its own when a download needs it; it is not meant to be run by hand.
+func cmdDownloadService(args []string) {
+	fs := flag.NewFlagSet("download-service", flag.ExitOnError)
+	cfgPath := fs.String("config", config.DefaultPath(), "config path")
+	_ = fs.Parse(args)
+	if err := dlsvc.Serve(*cfgPath, Version); err != nil {
+		fatal(err)
+	}
+}
+
+// cmdLogout ends the session on the server, then clears it locally whatever
+// the server said, keeping the device — the same order as the PC client.
+func cmdLogout(args []string) {
+	cfg, _, jsonFlag := loadCfg(args)
+	was := cfg.HasSessionCookie()
+	var serverErr error
+	if was {
+		done := output.Loading("正在退出登录…")
+		serverErr = api.Logout(client.New(cfg))
+		done()
+	}
+	cfg.ClearSession()
+	if err := cfg.Save(); err != nil {
+		fatal(err)
+	}
+	if output.WantJSON(jsonFlag) {
+		out := map[string]any{
+			"success":       true,
+			"was_logged_in": was,
+			"server_logout": was && serverErr == nil,
+			"config":        cfg.Path(),
+		}
+		if serverErr != nil {
+			out["server_error"] = serverErr.Error()
+		}
+		_ = output.PrintJSON(os.Stdout, out)
+		return
+	}
+	switch {
+	case !was:
+		fmt.Println("当前未登录，无需退出")
+	case serverErr != nil:
+		fmt.Println("已退出登录（设备信息已保留）")
+		fmt.Fprintf(os.Stderr, "注意：服务端未确认退出，会话可能仍然有效：%v\n", serverErr)
+	default:
+		fmt.Println("已退出登录（设备信息已保留）")
+	}
 }
 
 func cmdDevice(args []string) {
@@ -431,26 +489,35 @@ func cmdDownload(args []string) {
 		_ = err
 	}
 
-	mgr := download.Global()
-	mgr.BindClient(c)
-	mgr.SetMaxLive(cfg.MaxDownloads)
+	// The download runs in the download service, next to the TUI's and MCP's.
+	mgr := dlsvc.Open(cfg.Path())
 	mgr.SetDestDir(cfg.EffectiveDownloadDir())
 	name := filepath.Base(local)
-	task, _ := mgr.EnqueueEx(download.EnqueueOpts{
+	taskID, err := mgr.Add(download.EnqueueOpts{
 		Name: name, URL: urlStr, Dest: local, FID: fid,
 	})
+	if err != nil {
+		fatal(err)
+	}
+	// The service would carry on after this process: Ctrl+C pauses instead,
+	// as stopping the download used to (resume it in the TUI or rerun).
+	intr := make(chan os.Signal, 1)
+	signal.Notify(intr, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-intr
+		mgr.PauseID(taskID)
+		fmt.Fprintln(os.Stderr, "\n已暂停，可在 goquark tui 的下载中心继续")
+		os.Exit(130)
+	}()
 	start := time.Now()
 	for {
-		list := mgr.List()
 		var snap *download.Snapshot
-		for i := range list {
-			if task != nil && list[i].ID == task.ID {
-				snap = &list[i]
+		for _, s := range mgr.List() {
+			if s.ID == taskID {
+				s := s
+				snap = &s
 				break
 			}
-		}
-		if snap == nil && len(list) > 0 {
-			snap = &list[len(list)-1]
 		}
 		if snap != nil {
 			if snap.Total > 0 {
@@ -483,14 +550,9 @@ func cmdDownloads(args []string) {
 			watch = true
 		}
 	}
-	// Bind client if logged in (not required just to list empty)
-	c := client.New(cfg)
-	mgr := download.Global()
-	mgr.BindClient(c)
-	mgr.SetMaxLive(cfg.MaxDownloads)
-	mgr.SetDestDir(cfg.EffectiveDownloadDir())
-	// load history from disk (completed + incomplete)
-	_, _ = mgr.LoadPersisted()
+	// Only shows: asks a running download service, else reads downloads.json
+	// without writing it.
+	mgr := dlsvc.OpenViewer(cfg.Path())
 
 	printOnce := func() {
 		list := mgr.List()
@@ -629,6 +691,9 @@ func cmdUpdate(args []string) {
 			fmt.Println(string(b))
 		} else {
 			fmt.Printf("已更新到 %s\n路径: %s\n请重新运行 goquark。\n", res.Latest, res.BinaryPath)
+			if note := dlsvc.UpdateNote(config.DefaultPath()); note != "" {
+				fmt.Println(note)
+			}
 			if res.PendingCleanup != "" {
 				fmt.Printf("旧版本仍被当前进程占用，将在下次启动时清理：%s\n", res.PendingCleanup)
 			}

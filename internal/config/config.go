@@ -50,6 +50,11 @@ type Config struct {
 	// (manual check via key U / CLI / MCP still works).
 	DisableUpdateAutoCheck bool `json:"disable_update_auto_check,omitempty"`
 
+	// TUIQuitDownloads is what quitting the TUI does to running downloads:
+	// "pause", or "background" to let the download service finish them.
+	// Empty → ask on quit.
+	TUIQuitDownloads string `json:"tui_quit_downloads,omitempty"`
+
 	mu   sync.Mutex `json:"-"`
 	path string     `json:"-"`
 }

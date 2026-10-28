@@ -10,14 +10,49 @@ is kept for changes that break existing setups.
 
 ## [Unreleased]
 
+## [1.2.0] — 2026-10-28
+
 ### Added
-- `goquark login --wechat` logs in by scanning a QR code with WeChat instead
-  of the Quark app, the same flow as pan.quark.cn's WeChat login. A WeChat
-  account not yet linked to a Quark account with a phone number gets a clear
-  error (code 50022) instead of a phone-binding prompt. CLI only for now; the
-  TUI login screen and the MCP login tools still use the Quark-app QR
+- WeChat QR login, the same way the PC client logs in with WeChat:
+  `goquark login --wechat`, `Tab` on the TUI login screen to switch between
+  Quark-app and WeChat scan (Quark stays the default), and `method: "wechat"`
+  on the MCP tool `goquark_login`. Thanks to @litan1106 for the first version
+- `goquark logout` and the MCP tool `goquark_logout`. Logging out, there and
+  with `o` in the TUI, now ends the session on Quark's server first, as the PC
+  client does, then clears it locally even if the server does not answer; the
+  device profile is kept. Logging out in the TUI or over MCP also pauses the
+  downloads, to resume after logging in again. Before, the TUI only forgot the
+  session locally and the server kept it valid
 
 ### Changed
+- Downloads run in a background download service shared by the TUI, MCP and
+  `goquark download`, which now see one queue and one history. Before, each
+  process kept its own and the last to save overwrote the others', which could
+  lose or garble the download history when two were open. The service starts
+  with the first download and exits when idle; an update never interrupts a
+  download, the service moves to the new version once downloads finish.
+  `GOQUARK_DOWNLOAD_SERVICE=off` keeps downloads in each process.
+  `goquark download` is paused, not dropped, by Ctrl+C
+- Quitting the TUI with downloads running asks, the first time, whether to
+  pause them or let them finish in the background ("下次不再询问" ticked by
+  default). The choice is `tui_quit_downloads` in `config.json`, and the MCP
+  tool `goquark_download_settings` reads or changes it as `tui_quit`
+- The TUI's bottom line shows only the shortcuts that fit the terminal, whole,
+  and always ends with `?全部快捷键`; `?` opens the full list for the file
+  browser or the download center, where pressing a listed key runs it. The
+  shortcut keys also work with a Chinese input method (`？`, full-width letters)
+
+### Fixed
+- A large file paused, cancelled or hit by a failed part could show 100%:
+  a paused one then turned into 已完成 with most of the file missing, and one
+  paused right then could end up 已取消. Progress now stays at what is really
+  downloaded, so a pause resumes where it stopped and a failure shows as one
+
+### Security
+- `goquark whoami --json` and the MCP tools `goquark_whoami` and
+  `goquark_login_poll` no longer include the session's credentials (`pus`,
+  `sToken`, `kfToken`, `mobilekps`) in the account info; only nickname, ids,
+  membership and capacity are shown
 
 ## [1.1.0] — 2026-10-25
 

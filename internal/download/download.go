@@ -329,13 +329,28 @@ func downloadMultipart(ctx context.Context, hc *http.Client, dlURL, cookie, dest
 	}
 	wg.Wait()
 
-	// Bytes are in (or almost in); tell UI we are finalizing BEFORE
-	// waiting on partmap flush / file close — those can stall for seconds
-	// on shared disks (vmhgfs) after a multi-GB WriteAt burst.
+	// Workers also stop on pause, cancel or a failed part, and the manager
+	// reads done >= total as finished (finalizing, and a paused task at 100%
+	// is healed to done). So report 100% only when every part is in; any
+	// other exit reports what the part map holds, which is what a resume keeps.
+	var runErr error
+	select {
+	case runErr = <-errCh:
+	default:
+	}
+	have := pmap.completedBytes()
+	complete := runErr == nil && ctx.Err() == nil && have >= target
 	if opt.OnProgress != nil {
-		// force done=total so manager flips to StatusFinalizing
-		done.Store(target)
-		opt.OnProgress(target, target, 0)
+		if complete {
+			// Bytes are in; tell UI we are finalizing BEFORE waiting on partmap
+			// flush / file close — those can stall for seconds on shared disks
+			// (vmhgfs) after a multi-GB WriteAt burst.
+			done.Store(target)
+			opt.OnProgress(target, target, 0)
+		} else {
+			done.Store(have)
+			opt.OnProgress(have, target, 0)
+		}
 	}
 
 	close(flushStop)
@@ -351,20 +366,14 @@ func downloadMultipart(ctx context.Context, hc *http.Client, dlURL, cookie, dest
 		// abandon waiting; final save may still finish in background
 	}
 
-	select {
-	case err := <-errCh:
-		return err
-	default:
-	}
 	if ctx.Err() != nil {
 		return ctx.Err()
 	}
-	got := done.Load()
-	if got != target {
-		got = pmap.completedBytes()
-		if got != target {
-			return fmt.Errorf("incomplete: %d/%d", got, target)
-		}
+	if runErr != nil {
+		return runErr
+	}
+	if !complete {
+		return fmt.Errorf("incomplete: %d/%d", have, target)
 	}
 	// partmap cleanup is best-effort; manager also removes async
 	go func() { _ = os.Remove(partMapPath(dest)) }()

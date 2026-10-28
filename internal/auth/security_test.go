@@ -88,3 +88,24 @@ func TestWriteQRFilesAreNotWorldReadable(t *testing.T) {
 		t.Error("qrcode.png is empty")
 	}
 }
+
+// The stored login reply carries the session credential; what MCP hands to an
+// agent after login must not.
+func TestUserInfoFromSessionDropsCredentials(t *testing.T) {
+	cfg, err := config.Load(filepath.Join(t.TempDir(), "config.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.SetSession(nil, "st", []byte(`{"code":"OK","success":true,"data":{"pus":"secret","uid":"u1","timestamp":1}}`), "wechat")
+	got := UserInfoFromSession(cfg)
+	if _, ok := got["pus"]; ok {
+		t.Error("pus leaked")
+	}
+	if got["uid"] != "u1" {
+		t.Errorf("uid = %v, want u1", got["uid"])
+	}
+	cfg.SetSession(nil, "st", []byte(`not json pus=secret`), "wechat")
+	if got := UserInfoFromSession(cfg); got != nil {
+		t.Errorf("unparsable blob returned %v", got)
+	}
+}
