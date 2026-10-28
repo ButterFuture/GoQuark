@@ -29,7 +29,7 @@ GoQuark is a **Go** client for Quark cloud drive, aimed at terminals and automat
 
 | Area | Capability |
 |------|------------|
-| Login | **QR code** via the Quark app |
+| Login | **QR code** via the Quark app, or WeChat (`--wechat`) |
 | Download | Speed **close to the real client**; queue, pause/resume, progress & ETA |
 | Browse | Terminal **TUI**: select, multi-select, context menu, download center |
 | Scripts | CLI + pipe / `--json` output |
@@ -144,6 +144,7 @@ First launch walks you through QR login. For most day-to-day use, stay in the TU
 
 ```bash
 goquark login          # QR login (terminal + qrcode.png)
+goquark login --wechat # scan with WeChat instead of the Quark app
 goquark device
 goquark whoami
 goquark ls /
